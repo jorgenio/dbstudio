@@ -5,12 +5,14 @@
 
 mod form;
 mod grid;
+mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dbstudio_core::{
-    ConnectionConfig, ConnectionId, ExecuteRequest, ObjectNode, ObjectRef, QueryResult,
+    ColumnMeta, ConnectionConfig, ConnectionId, ExecuteRequest, ObjectNode, ObjectRef,
+    QueryResult,
 };
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
@@ -56,6 +58,10 @@ struct App {
     root: Option<ObjectRef>,
     tree: HashMap<ObjectRef, Vec<ObjectNode>>,
     expanded: HashSet<ObjectRef>,
+    /// Columns of the last executed result set (for "copy with names").
+    last_columns: Vec<ColumnMeta>,
+    /// Displayed row count of the last result set.
+    last_row_count: usize,
     status: String,
 }
 
@@ -74,16 +80,29 @@ enum Message {
     ChildrenLoaded(ObjectRef, Result<Vec<ObjectNode>, String>),
     TreeToggle(ObjectRef),
     Executed(Result<QueryResult, String>),
+    /// Copy selected rows (all when nothing is selected) as TSV.
+    CopyValues,
+    /// Copy rows as TSV with a header line of column names.
+    CopyWithHeaders,
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
 
 fn boot() -> (App, Task<Message>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    // Derive the editor palette from the app theme so the code pane matches
+    // the light chrome, then lift the surfaces to pure white.
+    let mut editor = CodeEditor::new(SAMPLE_SQL, "sql");
+    let mut editor_style = iced_code_editor::from_iced_theme(&theme::app_theme());
+    editor_style.background = iced::color!(0xffffff);
+    editor_style.gutter_background = iced::color!(0xfafbfd);
+    editor.set_theme(editor_style);
+
     (
         App {
             rt: Arc::new(rt),
-            editor: CodeEditor::new(SAMPLE_SQL, "sql"),
+            editor,
             grid: grid::empty(),
             search: AutocompleteState::new(Vec::new(), Filter::None),
             search_text: String::new(),
@@ -95,6 +114,8 @@ fn boot() -> (App, Task<Message>) {
             root: None,
             tree: HashMap::new(),
             expanded: HashSet::new(),
+            last_columns: Vec::new(),
+            last_row_count: 0,
             status: "listo — «+ Nueva conexión» para empezar".to_string(),
         },
         Task::none(),
@@ -333,6 +354,8 @@ impl App {
                 } else {
                     format!("{} afectada(s) ({ms} ms)", result.affected.unwrap_or(0))
                 };
+                self.last_columns = result.columns.clone();
+                self.last_row_count = result.row_count();
                 let (grid, init) = grid::build(result);
                 self.grid = grid;
                 init.map(Message::Grid)
@@ -341,47 +364,118 @@ impl App {
                 self.status = format!("error: {e}");
                 Task::none()
             }
+            Message::CopyValues => self.copy_rows(false),
+            Message::CopyWithHeaders => self.copy_rows(true),
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let toolbar = row![
-            text("DBStudio").size(18),
-            container(auto_complete(
-                &self.search,
-                "Buscar conexión…",
-                Message::SearchInput,
-                Message::SearchSubmit,
-                Some(Message::SearchSelect),
-            ))
-            .width(Length::Fixed(280.0))
-            .padding(4),
-            button(text("Ejecutar (F5)")).on_press(Message::Run),
-        ]
-        .spacing(12)
-        .align_y(iced::Alignment::Center)
-        .padding(8);
+    /// Copy the result grid as TSV: selected rows, or every row when the
+    /// selection is empty. `headers` prepends the column-name line.
+    fn copy_rows(&mut self, headers: bool) -> Task<Message> {
+        let tsv = {
+            let selection = self.grid.selection();
+            let rows = self.grid.store().rows();
+            let mut lines: Vec<String> = Vec::new();
+            if headers && !self.last_columns.is_empty() {
+                lines.push(
+                    self.last_columns
+                        .iter()
+                        .map(|c| sanitize(&c.name))
+                        .collect::<Vec<_>>()
+                        .join("\t"),
+                );
+            }
+            let mut n = 0usize;
+            for row in rows {
+                if !selection.is_empty() && !selection.contains(&row.idx) {
+                    continue;
+                }
+                lines.push(
+                    row.cells
+                        .iter()
+                        .map(|c| sanitize(&c.as_display()))
+                        .collect::<Vec<_>>()
+                        .join("\t"),
+                );
+                n += 1;
+            }
+            (lines, n)
+        };
+        let (lines, n) = tsv;
+        if n == 0 && lines.is_empty() {
+            self.status = "no hay resultados para copiar".to_string();
+            return Task::none();
+        }
+        self.status = format!(
+            "copiadas {n} fila(s){} al portapapeles",
+            if headers { " con encabezados" } else { "" }
+        );
+        iced::clipboard::write(lines.join("\r\n"))
+    }
 
-        let mut navigator: Column<'_, Message> = Column::new().spacing(4);
+    fn view(&self) -> Element<'_, Message> {
+        // ── toolbar ─────────────────────────────────────────────────────
+        let toolbar = container(
+            row![
+                button(text("Nueva conexión").size(13))
+                    .on_press(Message::OpenForm)
+                    .style(theme::flat),
+                button(text("Ejecutar (F5)").size(13))
+                    .on_press(Message::Run)
+                    .style(theme::solid),
+                rule::vertical(1).style(theme::hairline),
+                container(auto_complete(
+                    &self.search,
+                    "Buscar conexión…",
+                    Message::SearchInput,
+                    Message::SearchSubmit,
+                    Some(Message::SearchSelect),
+                ))
+                .width(Length::Fixed(280.0))
+                .padding(2),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .padding(8),
+        )
+        .width(Length::Fill)
+        .style(theme::chrome);
+
+        // ── navigator: connections + lazy object tree ───────────────────
+        let mut navigator: Column<'_, Message> = Column::new().spacing(2);
         navigator = navigator.push(
-            button(text("+ Nueva conexión"))
+            text("CONEXIONES").size(11).color(theme::muted()),
+        );
+        navigator = navigator.push(
+            button(text("+ Nueva conexión").size(13))
                 .width(Length::Fill)
-                .on_press(Message::OpenForm),
+                .on_press(Message::OpenForm)
+                .style(theme::flat),
         );
         if let Some(form) = &self.form {
-            navigator = navigator.push(form::view(form).map(Message::Form));
+            navigator = navigator.push(
+                container(form::view(form).map(Message::Form))
+                    .padding(6)
+                    .style(theme::workspace),
+            );
         } else {
             for (i, entry) in self.entries.iter().enumerate() {
-                let marker = match &entry.state {
-                    ConnState::Connected => "●",
-                    ConnState::Connecting => "◐",
-                    ConnState::Error(_) => "✕",
+                let (marker, marker_color) = match &entry.state {
+                    ConnState::Connected => ("●", theme::engine_color(entry.cfg.engine)),
+                    ConnState::Connecting => ("◐", theme::engine_color(entry.cfg.engine)),
+                    ConnState::Error(_) => ("✕", iced::color!(0xd93025)),
                 };
-                let label = format!("{marker} {}", entry.cfg.name);
+                let label = row![
+                    text(marker).size(11).color(marker_color),
+                    text(entry.cfg.name.clone()).size(13),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center);
                 navigator = navigator.push(
-                    button(text(label))
+                    button(label)
                         .width(Length::Fill)
-                        .on_press(Message::SelectConnection(i)),
+                        .on_press(Message::SelectConnection(i))
+                        .style(theme::flat),
                 );
             }
             if let Some(root) = &self.root {
@@ -391,59 +485,150 @@ impl App {
         let navigator = container(scrollable(navigator).height(Length::Fill).anchor_bottom())
             .width(Length::Fixed(260.0))
             .height(Length::Fill)
-            .style(container::secondary);
+            .padding(6)
+            .style(theme::navigator);
 
+        // ── editor pane with its tab strip ──────────────────────────────
+        let editor_tabs = container(
+            row![button(text("  Consulta 1  ").size(13)).style(theme::tab_active)]
+                .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+        .style(theme::chrome);
         let editor = container(self.editor.view().map(Message::Editor))
-            .height(Length::FillPortion(2))
-            .padding(4);
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(6)
+            .style(theme::workspace);
+
+        // ── result strip: tab + row count + copy actions ────────────────
+        let result_strip = container(
+            row![
+                button(text("  Resultado 1  ").size(13)).style(theme::tab_active),
+                text(format!("{} filas", self.last_row_count))
+                    .size(12)
+                    .color(theme::muted()),
+                container(
+                    row![
+                        button(text("Copiar").size(12))
+                            .on_press(Message::CopyValues)
+                            .style(theme::flat),
+                        button(text("Copiar c/nombres").size(12))
+                            .on_press(Message::CopyWithHeaders)
+                            .style(theme::flat),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+        .style(theme::chrome);
         let grid = container(self.grid.view().map(Message::Grid))
-            .height(Length::FillPortion(3));
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::workspace);
 
         let main = row![
             navigator,
             Column::new()
-                .push(editor)
-                .push(rule::horizontal(1))
-                .push(grid)
+                .push(editor_tabs)
+                .push(editor.height(Length::FillPortion(2)))
+                .push(rule::horizontal(1).style(theme::hairline))
+                .push(result_strip)
+                .push(grid.height(Length::FillPortion(3)))
                 .width(Length::Fill)
         ];
 
-        let status_bar = container(text(format!(" {}", self.status)).size(13))
-            .width(Length::Fill)
-            .padding(4)
-            .style(container::secondary);
+        // ── status bar: message left, live connection right ─────────────
+        let conn_label = self
+            .active_id
+            .and_then(|id| self.entries.iter().find(|e| e.cfg.id == id))
+            .map(|e| format!("● {} · {}", e.cfg.engine, e.cfg.name))
+            .unwrap_or_else(|| "sin conexión".to_string());
+        let status_bar = container(
+            row![
+                text(format!(" {}", self.status)).size(12),
+                container(
+                    row![text(conn_label).size(12).color(theme::muted())]
+                        .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([4.0, 8.0])
+        .style(theme::chrome);
 
         Column::new()
             .push(toolbar)
-            .push(rule::horizontal(1))
+            .push(rule::horizontal(1).style(theme::hairline))
             .push(main.height(Length::Fill))
-            .push(rule::horizontal(1))
+            .push(rule::horizontal(1).style(theme::hairline))
             .push(status_bar)
             .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::keyboard::listen().filter_map(|event| match event {
-            iced::keyboard::Event::KeyPressed {
+        iced::keyboard::listen().filter_map(|event| {
+            let iced::keyboard::Event::KeyPressed {
                 key,
                 modifiers,
                 repeat: false,
                 ..
-            } if modifiers.is_empty()
-                && matches!(
-                    key,
-                    iced::keyboard::Key::Named(iced::keyboard::key::Named::F5)
-                ) =>
-            {
-                Some(Message::Run)
+            } = event
+            else {
+                return None;
+            };
+            let control = modifiers.control() && !modifiers.alt();
+            match key {
+                // F5 alone runs the statement (the editor declines it).
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::F5)
+                    if modifiers.is_empty() =>
+                {
+                    Some(Message::Run)
+                }
+                // Ctrl+C reaches here only when no widget captured it, i.e.
+                // when the editor is not focused (it owns Ctrl+C itself).
+                iced::keyboard::Key::Character(ref c)
+                    if control && !modifiers.shift() && c.as_ref() == "c" =>
+                {
+                    Some(Message::CopyValues)
+                }
+                iced::keyboard::Key::Character(ref c)
+                    if control && modifiers.shift() && c.as_ref() == "c" =>
+                {
+                    Some(Message::CopyWithHeaders)
+                }
+                _ => None,
             }
-            _ => None,
         })
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        theme::app_theme()
     }
+}
+
+/// Flatten a cell/label into a single-line TSV field.
+fn sanitize(s: &str) -> String {
+    if !s.contains(['\t', '\r', '\n']) {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|ch| match ch {
+            '\t' | '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 fn push_tree<'a>(
@@ -482,3 +667,5 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .run()
 }
+
+
