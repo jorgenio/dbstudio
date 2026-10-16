@@ -104,6 +104,14 @@ impl Connections {
         let json = serde_json::to_string_pretty(&stripped).map_err(|e| e.to_string())?;
         std::fs::write(&self.path, json).map_err(|e| e.to_string())
     }
+
+    /// Drop every stored secret belonging to `cfg` (best-effort).
+    pub fn forget(&self, cfg: &ConnectionConfig) {
+        let _ = self.secrets.delete(&cfg.secret_account());
+        let ssh_account = format!("{}-ssh", cfg.secret_account());
+        let _ = self.secrets.delete(&ssh_account);
+        let _ = self.secrets.delete(&format!("{ssh_account}-pp"));
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +160,14 @@ mod tests {
         assert_eq!(ssh.host, "bastion.example.com");
         match &ssh.auth {
             SshAuth::Password { password } => assert_eq!(password.expose(), "tun3l-s3cret"),
+            other => panic!("expected password auth, got {other:?}"),
+        }
+
+        store.forget(&cfg);
+        let after = store.load();
+        assert!(after[0].password.is_none(), "password secret should be gone");
+        match &after[0].ssh.as_ref().unwrap().auth {
+            SshAuth::Password { password } => assert!(password.is_empty()),
             other => panic!("expected password auth, got {other:?}"),
         }
 

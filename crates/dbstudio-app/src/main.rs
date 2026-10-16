@@ -85,6 +85,8 @@ enum Message {
     SearchSubmit(String),
     SearchSelect(String),
     SelectConnection(usize),
+    /// Remove the selected connection from the sidebar and the store.
+    DeleteSelected,
     Run,
     OpenForm,
     Form(FormMsg),
@@ -272,6 +274,33 @@ impl App {
                     }
                 }
             }
+            Message::DeleteSelected => {
+                let Some(i) = self.selected.take() else {
+                    return Task::none();
+                };
+                if i >= self.entries.len() {
+                    return Task::none();
+                }
+                let removed = self.entries.remove(i);
+                if self.active_id == Some(removed.cfg.id) {
+                    // Dropping the session closes its tunnel/client.
+                    self.session = None;
+                    self.active_id = None;
+                    self.root = None;
+                    self.tree.clear();
+                    self.expanded.clear();
+                    self.query_context = None;
+                }
+                // No auto-reselect: a second Delete must be preceded by an
+                // explicit click, so one stray keypress can't cascade.
+                self.selected = None;
+                self.search_text.clear();
+                self.refresh_search();
+                self.store.forget(&removed.cfg);
+                self.status = format!("conexión «{}» eliminada", removed.cfg.name);
+                self.persist();
+                Task::none()
+            }
             Message::Run => {
                 let Some(session) = &self.session else {
                     self.status =
@@ -328,6 +357,11 @@ impl App {
                 Task::none()
             }
             Message::Connected(Ok((id, session, root, children))) => {
+                if !self.entries.iter().any(|e| e.cfg.id == id) {
+                    // Deleted while the handshake was in flight.
+                    self.status = "conexión descartada (fue eliminada)".to_string();
+                    return Task::none();
+                }
                 if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.id == id) {
                     e.state = ConnState::Connected;
                 }
@@ -574,9 +608,20 @@ impl App {
 
         // ── navigator: connections + lazy object tree ───────────────────
         let mut navigator: Column<'_, Message> = Column::new().spacing(2);
-        navigator = navigator.push(
-            text("CONEXIONES").size(11).color(theme::muted()),
-        );
+        let mut conn_header = row![text("CONEXIONES").size(11).color(theme::muted())]
+            .align_y(iced::Alignment::Center);
+        if self.selected.is_some() && self.form.is_none() {
+            conn_header = conn_header.push(
+                container(
+                    button(text("✕ Eliminar").size(11))
+                        .on_press(Message::DeleteSelected)
+                        .style(theme::flat),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            );
+        }
+        navigator = navigator.push(conn_header);
         navigator = navigator.push(
             button(text("+ Nueva conexión").size(13))
                 .width(Length::Fill)
@@ -760,6 +805,11 @@ impl App {
                     if control && modifiers.shift() && c.as_ref() == "c" =>
                 {
                     Some(Message::CopyWithHeaders)
+                }
+                // Delete removes the selected sidebar connection (captured by
+                // the editor while it has focus, so typing stays safe).
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete) => {
+                    Some(Message::DeleteSelected)
                 }
                 _ => None,
             }
