@@ -7,11 +7,15 @@ license.workspace = true
 [dependencies]
 dbstudio-core = { workspace = true }
 dbstudio-drivers = { workspace = true }
+dbstudio-secrets = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }
 iced = { workspace = true, features = ["tokio"] }
 iced-code-editor = { workspace = true }
 iced-autocomplete = { workspace = true }
 oriel-core = { workspace = true }
 oriel-iced = { workspace = true }
+rfd = { version = "0.15", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

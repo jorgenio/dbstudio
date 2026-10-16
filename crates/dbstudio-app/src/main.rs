@@ -3,19 +3,22 @@
 //! editor runs statements through `dbstudio-drivers` and the result grid is
 //! rebuilt from the driver's normalized `QueryResult`.
 
+mod export;
 mod form;
 mod grid;
+mod store;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dbstudio_core::{
-    ColumnMeta, ConnectionConfig, ConnectionId, ExecuteRequest, ObjectNode, ObjectRef,
-    QueryResult,
+    CellValue, ColumnMeta, ConnectionConfig, ConnectionId, ExecuteRequest, ObjectNode,
+    ObjectRef, QueryResult,
 };
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
+use store::Connections;
 use iced::widget::{button, container, row, rule, scrollable, text, Column};
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
@@ -34,6 +37,8 @@ const MAX_ROWS: usize = 10_000;
 
 #[derive(Clone, Debug)]
 enum ConnState {
+    /// Saved but never (re)connected in this session.
+    Idle,
     Connecting,
     Connected,
     Error(String),
@@ -46,6 +51,7 @@ struct ConnEntry {
 
 struct App {
     rt: Arc<tokio::runtime::Runtime>,
+    store: Connections,
     editor: CodeEditor,
     grid: VirtualGrid<grid::ResultStore>,
     search: AutocompleteState<String>,
@@ -84,6 +90,10 @@ enum Message {
     CopyValues,
     /// Copy rows as TSV with a header line of column names.
     CopyWithHeaders,
+    /// Open the save dialog for the current result set.
+    Export,
+    /// The save dialog resolved (None = cancelled).
+    ExportTo(Option<std::path::PathBuf>),
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
@@ -99,14 +109,32 @@ fn boot() -> (App, Task<Message>) {
     editor_style.gutter_background = iced::color!(0xfafbfd);
     editor.set_theme(editor_style);
 
+    // Saved connections: configs from disk, passwords from the keyring.
+    let store = Connections::open();
+    let entries: Vec<ConnEntry> = store
+        .load()
+        .into_iter()
+        .map(|cfg| ConnEntry {
+            cfg,
+            state: ConnState::Idle,
+        })
+        .collect();
+    let names: Vec<String> = entries.iter().map(|e| e.cfg.name.clone()).collect();
+    let status = if entries.is_empty() {
+        "listo — «+ Nueva conexión» para empezar".to_string()
+    } else {
+        format!("{} conexión(es) guardada(s)", entries.len())
+    };
+
     (
         App {
             rt: Arc::new(rt),
+            store,
             editor,
             grid: grid::empty(),
-            search: AutocompleteState::new(Vec::new(), Filter::None),
+            search: AutocompleteState::new(names, Filter::None),
             search_text: String::new(),
-            entries: Vec::new(),
+            entries,
             selected: None,
             form: None,
             session: None,
@@ -116,7 +144,7 @@ fn boot() -> (App, Task<Message>) {
             expanded: HashSet::new(),
             last_columns: Vec::new(),
             last_row_count: 0,
-            status: "listo — «+ Nueva conexión» para empezar".to_string(),
+            status,
         },
         Task::none(),
     )
@@ -173,6 +201,14 @@ impl App {
         self.search.set_options(options);
     }
 
+    /// Save every connection config (passwords to the keyring, not disk).
+    fn persist(&mut self) {
+        let cfgs: Vec<ConnectionConfig> = self.entries.iter().map(|e| e.cfg.clone()).collect();
+        if let Err(e) = self.store.save(&cfgs) {
+            self.status = format!("aviso: no se pudo guardar: {e}");
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(msg) => {
@@ -210,6 +246,12 @@ impl App {
                     ConnState::Connecting => {
                         self.status = format!("conectando… {name}");
                         Task::none()
+                    }
+                    ConnState::Idle => {
+                        self.status = format!("conectando: {name}");
+                        let cfg = self.entries[i].cfg.clone();
+                        self.entries[i].state = ConnState::Connecting;
+                        connect_task(self.rt.clone(), cfg)
                     }
                     ConnState::Error(err) => {
                         self.status = format!("reintentando {name}: {err}");
@@ -259,6 +301,7 @@ impl App {
                         self.selected = Some(self.entries.len() - 1);
                         self.search_text = cfg.name.clone();
                         self.refresh_search();
+                        self.persist();
                         self.status = format!("conectando a {}…", cfg.name);
                         connect_task(self.rt.clone(), cfg)
                     }
@@ -366,6 +409,55 @@ impl App {
             }
             Message::CopyValues => self.copy_rows(false),
             Message::CopyWithHeaders => self.copy_rows(true),
+            Message::Export => {
+                if self.last_columns.is_empty() {
+                    self.status = "no hay resultados para exportar".to_string();
+                    return Task::none();
+                }
+                // The native dialog blocks; run it off-thread and resume via
+                // a oneshot channel.
+                let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+                std::thread::spawn(move || {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_file_name("resultado.csv")
+                        .add_filter("CSV", &["csv"])
+                        .add_filter("JSON", &["json"]);
+                    if let Some(docs) = dirs::document_dir() {
+                        dialog = dialog.set_directory(docs);
+                    }
+                    let _ = tx.send(dialog.save_file());
+                });
+                Task::perform(
+                    async move { rx.await.unwrap_or(None) },
+                    Message::ExportTo,
+                )
+            }
+            Message::ExportTo(Some(path)) => {
+                let is_json = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+                let rows: Vec<&[CellValue]> = self
+                    .grid
+                    .store()
+                    .rows()
+                    .iter()
+                    .map(|r| r.cells.as_slice())
+                    .collect();
+                let content = if is_json {
+                    export::json(&self.last_columns, &rows)
+                } else {
+                    export::csv(&self.last_columns, &rows)
+                };
+                match std::fs::write(&path, content) {
+                    Ok(()) => self.status = format!("exportado a {}", path.display()),
+                    Err(e) => self.status = format!("error al exportar: {e}"),
+                }
+                Task::none()
+            }
+            Message::ExportTo(None) => {
+                self.status = "exportación cancelada".to_string();
+                Task::none()
+            }
         }
     }
 
@@ -463,6 +555,7 @@ impl App {
                 let (marker, marker_color) = match &entry.state {
                     ConnState::Connected => ("●", theme::engine_color(entry.cfg.engine)),
                     ConnState::Connecting => ("◐", theme::engine_color(entry.cfg.engine)),
+                    ConnState::Idle => ("○", theme::muted()),
                     ConnState::Error(_) => ("✕", iced::color!(0xd93025)),
                 };
                 let label = row![
@@ -516,6 +609,9 @@ impl App {
                             .style(theme::flat),
                         button(text("Copiar c/nombres").size(12))
                             .on_press(Message::CopyWithHeaders)
+                            .style(theme::flat),
+                        button(text("Exportar…").size(12))
+                            .on_press(Message::Export)
                             .style(theme::flat),
                     ]
                     .spacing(6)
