@@ -1,0 +1,3 @@
+[build]
+# D: runs out of space with debuginfo-heavy artifacts; keep target on E:.
+target-dir = "E:/navicat/target"

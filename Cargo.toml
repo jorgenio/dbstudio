@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dbstudio-core",
+    "crates/dbstudio-secrets",
+    "crates/dbstudio-ssh",
+    "crates/dbstudio-introspect",
+    "crates/dbstudio-drivers",
+    "crates/dbstudio-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+dbstudio-core = { path = "crates/dbstudio-core" }
+dbstudio-secrets = { path = "crates/dbstudio-secrets" }
+dbstudio-ssh = { path = "crates/dbstudio-ssh" }
+dbstudio-introspect = { path = "crates/dbstudio-introspect" }
+dbstudio-drivers = { path = "crates/dbstudio-drivers" }
+
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# time / ids
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# db drivers
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-serde_json-1"] }
+rust_decimal = { version = "1", features = ["db-postgres"] }
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "1"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring", "chrono"] }
+mongodb = { version = "3", features = ["compat-3-3-0"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "serde_json", "column_decltype"] }
+bson = "3"
+
+# ssh
+russh = { version = "0.64", default-features = false, features = ["ring", "flate2", "rsa"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
+# secrets
+keyring = "4"
+dirs = "6"
+
+# gui
+iced = "0.14"
+iced-code-editor = "0.5"
+oriel-core = "0.1"
+oriel-iced = "0.1"
+iced-autocomplete = "0.1"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

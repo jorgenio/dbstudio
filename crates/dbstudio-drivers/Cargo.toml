@@ -1,0 +1,32 @@
+[package]
+name = "dbstudio-drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dbstudio-core = { workspace = true }
+dbstudio-ssh = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+
+tokio-postgres = { workspace = true }
+postgres-types = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rust_decimal = { workspace = true }
+
+mysql_async = { workspace = true }
+
+mongodb = { workspace = true }
+bson = { workspace = true }
+
+rusqlite = { workspace = true }
+
+tiberius = { version = "0.13", features = ["tds73", "rustls-pki-types"] }
+tokio-util = { version = "0.7", features = ["compat"] }
