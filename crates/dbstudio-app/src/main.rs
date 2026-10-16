@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dbstudio_core::{
-    CellValue, ColumnMeta, ConnectionConfig, ConnectionId, ExecuteRequest, ObjectNode,
-    ObjectRef, QueryResult,
+    CellValue, ColumnMeta, ConnectionConfig, ConnectionId, Engine, ExecuteRequest, ObjectKind,
+    ObjectNode, ObjectRef, QueryResult,
 };
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
@@ -68,6 +68,9 @@ struct App {
     last_columns: Vec<ColumnMeta>,
     /// Displayed row count of the last result set.
     last_row_count: usize,
+    /// Driver context for bare MongoDB filters ("db.collection"), set when a
+    /// collection node is opened in the editor.
+    query_context: Option<String>,
     status: String,
 }
 
@@ -85,6 +88,9 @@ enum Message {
     Connected(Result<ConnectedPayload, String>),
     ChildrenLoaded(ObjectRef, Result<Vec<ObjectNode>, String>),
     TreeToggle(ObjectRef),
+    /// Table/view/collection clicked: put a starter query in the editor and
+    /// expand the node's children.
+    TreeOpenObject(ObjectRef, ObjectKind),
     Executed(Result<QueryResult, String>),
     /// Copy selected rows (all when nothing is selected) as TSV.
     CopyValues,
@@ -144,6 +150,7 @@ fn boot() -> (App, Task<Message>) {
             expanded: HashSet::new(),
             last_columns: Vec::new(),
             last_row_count: 0,
+            query_context: None,
             status,
         },
         Task::none(),
@@ -274,11 +281,9 @@ impl App {
                 }
                 let client = session.client.clone();
                 self.status = "ejecutando…".to_string();
-                execute_task(
-                    self.rt.clone(),
-                    client,
-                    ExecuteRequest::new(sql).with_max_rows(MAX_ROWS),
-                )
+                let mut req = ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
+                req.context = self.query_context.clone();
+                execute_task(self.rt.clone(), client, req)
             }
             Message::OpenForm => {
                 self.form = Some(ConnForm::default());
@@ -325,6 +330,7 @@ impl App {
                 self.tree.insert(root.clone(), children);
                 self.expanded.clear();
                 self.expanded.insert(root.clone());
+                self.query_context = None;
                 self.root = Some(root);
                 self.session = Some(session);
                 self.active_id = Some(id);
@@ -348,31 +354,16 @@ impl App {
                 self.status = format!("error de conexión: {e}");
                 Task::none()
             }
-            Message::TreeToggle(node) => {
-                if self.expanded.contains(&node) {
-                    self.expanded.remove(&node);
-                    return Task::none();
-                }
-                self.expanded.insert(node.clone());
-                if self.tree.contains_key(&node) {
-                    return Task::none();
-                }
-                let Some(session) = &self.session else {
-                    return Task::none();
+            Message::TreeToggle(node) => self.expand(&node),
+            Message::TreeOpenObject(obj, kind) => {
+                let sql = self.query_for(&obj, kind);
+                self.query_context = match kind {
+                    ObjectKind::Collection => Some(obj.path.join(".")),
+                    _ => None,
                 };
-                let client = session.client.clone();
-                let rt = self.rt.clone();
-                let reply = node.clone();
-                Task::perform(
-                    async move {
-                        rt.spawn(async move {
-                            client.list_children(&node).await.map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?
-                    },
-                    move |res| Message::ChildrenLoaded(reply.clone(), res),
-                )
+                let expand = self.expand(&obj);
+                let edit = self.editor.reset(&sql).map(Message::Editor);
+                Task::batch([expand, edit])
             }
             Message::ChildrenLoaded(parent, Ok(children)) => {
                 self.tree.insert(parent, children);
@@ -503,6 +494,46 @@ impl App {
             if headers { " con encabezados" } else { "" }
         );
         iced::clipboard::write(lines.join("\r\n"))
+    }
+
+    /// Toggle (or lazily load) the children of a navigator node.
+    fn expand(&mut self, node: &ObjectRef) -> Task<Message> {
+        if self.expanded.contains(node) {
+            self.expanded.remove(node);
+            return Task::none();
+        }
+        self.expanded.insert(node.clone());
+        if self.tree.contains_key(node) {
+            return Task::none();
+        }
+        let Some(session) = &self.session else {
+            return Task::none();
+        };
+        let client = session.client.clone();
+        let rt = self.rt.clone();
+        let reply = node.clone();
+        let target = node.clone();
+        Task::perform(
+            async move {
+                rt.spawn(async move {
+                    client.list_children(&target).await.map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            move |res| Message::ChildrenLoaded(reply.clone(), res),
+        )
+    }
+
+    /// Starter query for a clicked table/view/collection node.
+    fn query_for(&self, obj: &ObjectRef, kind: ObjectKind) -> String {
+        let engine = self
+            .entries
+            .iter()
+            .find(|e| Some(e.cfg.id) == self.active_id)
+            .map(|e| e.cfg.engine)
+            .unwrap_or(Engine::Sqlite);
+        query_for_engine(engine, obj, kind)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -727,6 +758,66 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// Starter query for `obj`, dialect-aware. MongoDB nodes produce an Extended
+/// JSON `find` command instead of SQL.
+fn query_for_engine(engine: Engine, obj: &ObjectRef, kind: ObjectKind) -> String {
+    let last = obj.path.last().map(String::as_str).unwrap_or("");
+
+    if kind == ObjectKind::Collection {
+        let esc = last.replace('\\', "\\\\").replace('"', "\\\"");
+        return format!("{{\n  \"find\": \"{esc}\",\n  \"filter\": {{}},\n  \"limit\": 100\n}}");
+    }
+
+    let from = match engine {
+        // The first segment is the file's display label, not a schema.
+        Engine::Sqlite => quote_ident(last, engine),
+        // A session is bound to its database: the db segment would mean a
+        // cross-database reference (rejected by PostgreSQL).
+        Engine::Postgres | Engine::Oracle | Engine::Mongodb => obj
+            .path
+            .iter()
+            .skip(1)
+            .map(|s| quote_ident(s, engine))
+            .collect::<Vec<_>>()
+            .join("."),
+        // [db, table] → db.table keeps browsing other databases portable.
+        Engine::Mysql | Engine::MariaDb => obj
+            .path
+            .iter()
+            .map(|s| quote_ident(s, engine))
+            .collect::<Vec<_>>()
+            .join("."),
+        // [db, table] → db..table resolves the default schema cross-database.
+        Engine::SqlServer if obj.path.len() == 2 => format!(
+            "{}..{}",
+            quote_ident(&obj.path[0], engine),
+            quote_ident(&obj.path[1], engine)
+        ),
+        Engine::SqlServer => obj
+            .path
+            .iter()
+            .skip(1)
+            .map(|s| quote_ident(s, engine))
+            .collect::<Vec<_>>()
+            .join("."),
+    };
+
+    if engine == Engine::SqlServer {
+        format!("SELECT TOP 100 * FROM {from};")
+    } else {
+        format!("SELECT * FROM {from} LIMIT 100;")
+    }
+}
+
+/// Quote an identifier with the dialect's delimiter.
+fn quote_ident(seg: &str, engine: Engine) -> String {
+    match engine {
+        Engine::Mysql | Engine::MariaDb => format!("`{}`", seg.replace('`', "``")),
+        Engine::SqlServer => format!("[{}]", seg.replace(']', "]]")),
+        _ => format!("\"{}\"", seg.replace('"', "\"\"")),
+    }
+}
+
 fn push_tree<'a>(
     app: &'a App,
     parent: &ObjectRef,
@@ -744,10 +835,16 @@ fn push_tree<'a>(
             (false, _) => "·",
         };
         let pad = "  ".repeat(depth);
+        let press = match node.kind {
+            ObjectKind::Table | ObjectKind::View | ObjectKind::Collection => {
+                Message::TreeOpenObject(node.object.clone(), node.kind)
+            }
+            _ => Message::TreeToggle(node.object.clone()),
+        };
         col = col.push(
             button(text(format!("{pad}{marker} {}", node.label)).size(13))
                 .width(Length::Fill)
-                .on_press(Message::TreeToggle(node.object.clone())),
+                .on_press(press),
         );
         if is_open {
             col = push_tree(app, &node.object, depth + 1, col);
@@ -762,6 +859,61 @@ fn main() -> iced::Result {
         .theme(App::theme)
         .subscription(App::subscription)
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(path: &[&str]) -> ObjectRef {
+        ObjectRef {
+            connection: ConnectionId::nil(),
+            path: path.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn pg_table_query_drops_database_segment() {
+        let sql = query_for_engine(Engine::Postgres, &obj(&["appdb", "public", "usuarios"]), ObjectKind::Table);
+        assert_eq!(sql, "SELECT * FROM \"public\".\"usuarios\" LIMIT 100;");
+    }
+
+    #[test]
+    fn sqlite_table_query_drops_file_label() {
+        let sql = query_for_engine(Engine::Sqlite, &obj(&["demo.db", "usuarios"]), ObjectKind::Table);
+        assert_eq!(sql, "SELECT * FROM \"usuarios\" LIMIT 100;");
+    }
+
+    #[test]
+    fn mysql_table_query_keeps_database() {
+        let sql = query_for_engine(Engine::Mysql, &obj(&["tienda", "pedidos"]), ObjectKind::Table);
+        assert_eq!(sql, "SELECT * FROM `tienda`.`pedidos` LIMIT 100;");
+    }
+
+    #[test]
+    fn mssql_cross_database_uses_dot_dot() {
+        let sql = query_for_engine(Engine::SqlServer, &obj(&["ventas", "orders"]), ObjectKind::Table);
+        assert_eq!(sql, "SELECT TOP 100 * FROM [ventas]..[orders];");
+    }
+
+    #[test]
+    fn mongo_collection_is_extended_json() {
+        let sql = query_for_engine(
+            Engine::Mongodb,
+            &obj(&["appdb", "usuarios"]),
+            ObjectKind::Collection,
+        );
+        assert_eq!(
+            sql,
+            "{\n  \"find\": \"usuarios\",\n  \"filter\": {},\n  \"limit\": 100\n}"
+        );
+    }
+
+    #[test]
+    fn view_generates_select_like_table() {
+        let sql = query_for_engine(Engine::Postgres, &obj(&["appdb", "public", "v_activos"]), ObjectKind::View);
+        assert_eq!(sql, "SELECT * FROM \"public\".\"v_activos\" LIMIT 100;");
+    }
 }
 
 
