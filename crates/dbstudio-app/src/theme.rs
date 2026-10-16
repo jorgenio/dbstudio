@@ -171,6 +171,42 @@ pub fn solid(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Caption button of the custom title bar (minimize / maximize).
+pub fn win_control(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(color!(0xe4e7eb).into()),
+            button::Status::Pressed => Some(color!(0xd8dce2).into()),
+            _ => None,
+        },
+        text_color: color!(0x2e3238),
+        border: Border::default(),
+        ..Default::default()
+    }
+}
+
+/// Close caption button: paints red on hover like the native title bar.
+pub fn win_close(_theme: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(
+        status,
+        button::Status::Hovered | button::Status::Pressed
+    );
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(color!(0xe81123).into()),
+            button::Status::Pressed => Some(color!(0xc50f1f).into()),
+            _ => None,
+        },
+        text_color: if hovered {
+            color!(0xffffff)
+        } else {
+            color!(0x2e3238)
+        },
+        border: Border::default(),
+        ..Default::default()
+    }
+}
+
 // --- engine accents -------------------------------------------------------
 
 /// Accent color for the connection/tree markers of each engine.

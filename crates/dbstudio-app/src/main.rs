@@ -19,7 +19,7 @@ use dbstudio_core::{
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
 use store::Connections;
-use iced::widget::{button, container, row, rule, scrollable, text, Column};
+use iced::widget::{button, container, row, rule, scrollable, stack, text, Column, MouseArea, Space};
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
 use iced_code_editor::{CodeEditor, Message as EditorMessage};
@@ -75,6 +75,11 @@ struct App {
     /// collection node is opened in the editor.
     query_context: Option<String>,
     status: String,
+    /// Id of the main window; set once the window is open (the frameless
+    /// title bar needs it to drag/minimize/close the window).
+    window_id: Option<iced::window::Id>,
+    /// When the title bar drag region was last pressed (double-click).
+    last_title_press: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -105,6 +110,25 @@ enum Message {
     Export,
     /// The save dialog resolved (None = cancelled).
     ExportTo(Option<std::path::PathBuf>),
+    /// The main window reported its id (needed by the custom title bar).
+    WindowOpened(iced::window::Id),
+    /// Press on the title bar drag region: start an OS window drag (a
+    /// second press inside the double-click interval maximizes instead).
+    WinDrag,
+    /// Title-bar buttons: minimize / maximize / close / system menu.
+    WinMinimize,
+    WinToggleMax,
+    WinClose,
+    WinSystemMenu,
+    /// Window events (used to re-assert the frameless style after
+    /// resizes/focus changes, when winit may re-apply frame styles).
+    WinEvent(iced::window::Event),
+    /// Press on an invisible edge/corner resize zone.
+    WinResize(iced::window::Direction),
+    /// Startup frame fix step: 1 = enlarge 1px, 0 = restore 1px.
+    WinNudgeTitle(bool),
+    /// `iced::window::run` completion marker (no-op).
+    WinFrameChecked,
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
@@ -158,6 +182,8 @@ fn boot() -> (App, Task<Message>) {
             executed: false,
             query_context: None,
             status,
+            window_id: None,
+            last_title_press: None,
         },
         Task::none(),
     )
@@ -488,6 +514,87 @@ impl App {
                 self.status = "exportación cancelada".to_string();
                 Task::none()
             }
+            Message::WindowOpened(id) => {
+                self.window_id = Some(id);
+                // Windows DWM bakes a caption-sized presentation offset at
+                // creation (winit keeps WS_CAPTION for snap support while
+                // spreading the client over the frame). Strip the frame
+                // styles, then nudge the height so DWM re-lays the
+                // composition out at the client origin.
+                Task::batch([
+                    enforce_title_frame(id),
+                    Task::perform(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        },
+                        |_| Message::WinNudgeTitle(true),
+                    ),
+                ])
+            }
+            Message::WinNudgeTitle(up) => {
+                let Some(id) = self.window_id else {
+                    return Task::none();
+                };
+                if up {
+                    Task::batch([
+                        nudge_title_frame(id, 1),
+                        Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                            },
+                            |_| Message::WinNudgeTitle(false),
+                        ),
+                    ])
+                } else {
+                    nudge_title_frame(id, -1)
+                }
+            }
+            Message::WinFrameChecked => Task::none(),
+            Message::WinEvent(ev) => match ev {
+                iced::window::Event::Resized(_)
+                | iced::window::Event::Focused
+                | iced::window::Event::Moved(_) => match self.window_id {
+                    Some(id) => enforce_title_frame(id),
+                    None => Task::none(),
+                },
+                _ => Task::none(),
+            },
+            Message::WinResize(direction) => match self.window_id {
+                Some(id) => iced::window::drag_resize(id, direction),
+                None => Task::none(),
+            },
+            Message::WinDrag => {
+                let Some(id) = self.window_id else {
+                    return Task::none();
+                };
+                // Two presses inside the double-click interval maximize
+                // instead of starting a second OS drag.
+                let now = std::time::Instant::now();
+                if let Some(last) = self.last_title_press
+                    && now.duration_since(last) < std::time::Duration::from_millis(450)
+                {
+                    self.last_title_press = None;
+                    return iced::window::toggle_maximize(id);
+                }
+                self.last_title_press = Some(now);
+                iced::window::drag(id)
+            }
+            Message::WinMinimize => match self.window_id {
+                Some(id) => iced::window::minimize(id, true),
+                None => Task::none(),
+            },
+            Message::WinToggleMax => match self.window_id {
+                Some(id) => iced::window::toggle_maximize(id),
+                None => Task::none(),
+            },
+            Message::WinClose => match self.window_id {
+                Some(id) => iced::window::close(id),
+                None => Task::none(),
+            },
+            Message::WinSystemMenu => match self.window_id {
+                Some(id) => iced::window::show_system_menu(id),
+                None => Task::none(),
+            },
         }
     }
 
@@ -576,35 +683,74 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // ── toolbar ─────────────────────────────────────────────────────
-        // Fixed height: the vertical rule inside the row is a Fill child and
-        // would otherwise stretch the hug-height band unpredictably.
-        let toolbar = container(
-            row![
-                button(text("+ Nueva conexión").size(13))
-                    .on_press(Message::OpenForm)
-                    .style(theme::flat),
-                button(text("Ejecutar (F5)").size(13))
-                    .on_press(Message::Run)
-                    .style(theme::solid),
-                rule::vertical(1).style(theme::hairline),
-                container(auto_complete(
-                    &self.search,
-                    "Buscar conexión…",
-                    Message::SearchInput,
-                    Message::SearchSubmit,
-                    Some(Message::SearchSelect),
-                ))
-                .width(Length::Fixed(280.0))
-                .padding(2),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-            .padding(8),
-        )
+        // ── custom title bar: brand + actions + window controls ─────────
+        // Frameless window: the bar replaces the native title bar, so it is
+        // also the drag region (MouseArea) — the widgets inside must capture
+        // their own clicks. Fixed height: the vertical rule is a Fill child
+        // and would otherwise stretch the hug-height band unpredictably.
+        let window_controls = row![
+            button(text("–").size(14))
+                .width(Length::Fixed(46.0))
+                .height(Length::Fill)
+                .on_press(Message::WinMinimize)
+                .style(theme::win_control),
+            button(text("□").size(13))
+                .width(Length::Fixed(46.0))
+                .height(Length::Fill)
+                .on_press(Message::WinToggleMax)
+                .style(theme::win_control),
+            button(text("✕").size(13))
+                .width(Length::Fixed(46.0))
+                .height(Length::Fill)
+                .on_press(Message::WinClose)
+                .style(theme::win_close),
+        ]
+        .spacing(0)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center);
+
+        let toolbar = row![
+            text("DBStudio").size(14),
+            button(text("+ Nueva conexión").size(13))
+                .on_press(Message::OpenForm)
+                .style(theme::flat),
+            button(text("Ejecutar (F5)").size(13))
+                .on_press(Message::Run)
+                .style(theme::solid),
+            rule::vertical(1).style(theme::hairline),
+            container(auto_complete(
+                &self.search,
+                "Buscar conexión…",
+                Message::SearchInput,
+                Message::SearchSubmit,
+                Some(Message::SearchSelect),
+            ))
+            .width(Length::Fixed(280.0))
+            .padding(2),
+            container(window_controls)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::End),
+        ]
         .width(Length::Fill)
-        .height(Length::Fixed(44.0))
-        .style(theme::chrome);
+        .height(Length::Fill)
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let title_bar = MouseArea::new(
+            container(toolbar)
+                .width(Length::Fill)
+                .height(Length::Fixed(40.0))
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 8.0,
+                })
+                .style(theme::chrome),
+        )
+        .on_press(Message::WinDrag)
+        .on_right_press(Message::WinSystemMenu);
 
         // ── navigator: connections + lazy object tree ───────────────────
         let mut navigator: Column<'_, Message> = Column::new().spacing(2);
@@ -730,7 +876,7 @@ impl App {
 
         let main = row![
             navigator,
-            Column::new()
+                Column::new()
                 .push(editor_tabs)
                 .push(editor.height(Length::FillPortion(2)))
                 .push(rule::horizontal(1).style(theme::hairline))
@@ -766,17 +912,48 @@ impl App {
         .padding([4.0, 8.0])
         .style(theme::chrome);
 
-        Column::new()
-            .push(toolbar)
+        let app: Element<Message> = Column::new()
+            .push(title_bar)
             .push(rule::horizontal(1).style(theme::hairline))
             .push(main.height(Length::Fill))
             .push(rule::horizontal(1).style(theme::hairline))
             .push(status_bar)
-            .into()
+            .into();
+
+        // Frameless windows lose the OS resize borders: lay invisible
+        // edge/corner zones on top (same hit pattern as native frames).
+        stack(vec![
+            app,
+            resize_edge_zone(iced::window::Direction::North, true, true),
+            resize_edge_zone(iced::window::Direction::South, true, false),
+            resize_edge_zone(iced::window::Direction::West, false, true),
+            resize_edge_zone(iced::window::Direction::East, false, false),
+            resize_corner_zone(
+                iced::window::Direction::NorthWest,
+                iced::Alignment::Start,
+                iced::Alignment::Start,
+            ),
+            resize_corner_zone(
+                iced::window::Direction::NorthEast,
+                iced::Alignment::End,
+                iced::Alignment::Start,
+            ),
+            resize_corner_zone(
+                iced::window::Direction::SouthWest,
+                iced::Alignment::Start,
+                iced::Alignment::End,
+            ),
+            resize_corner_zone(
+                iced::window::Direction::SouthEast,
+                iced::Alignment::End,
+                iced::Alignment::End,
+            ),
+        ])
+        .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::keyboard::listen().filter_map(|event| {
+        let keys = iced::keyboard::listen().filter_map(|event| {
             let iced::keyboard::Event::KeyPressed {
                 key,
                 modifiers,
@@ -813,7 +990,12 @@ impl App {
                 }
                 _ => None,
             }
-        })
+        });
+        // The custom title bar needs the window id for drag/min/close; the
+        // window events keep the frameless style asserted after resizes.
+        let window = iced::window::open_events().map(Message::WindowOpened);
+        let events = iced::window::events().map(|(_id, ev)| Message::WinEvent(ev));
+        Subscription::batch([keys, window, events])
     }
 
     fn theme(&self) -> Theme {
@@ -930,8 +1112,235 @@ fn push_tree<'a>(
     col
 }
 
+/// Thickness of the invisible OS-style resize borders.
+const RESIZE_EDGE: f32 = 6.0;
+/// Size of the invisible resize corners.
+const RESIZE_CORNER: f32 = 12.0;
+
+/// Invisible strip along a window edge that starts an OS resize drag.
+/// `horizontal` = top/bottom edge; `start` = top/left side.
+fn resize_edge_zone(
+    direction: iced::window::Direction,
+    horizontal: bool,
+    start: bool,
+) -> Element<'static, Message> {
+    use iced::mouse::Interaction;
+
+    let interaction = if horizontal {
+        Interaction::ResizingVertically
+    } else {
+        Interaction::ResizingHorizontally
+    };
+    let align = if start {
+        iced::Alignment::Start
+    } else {
+        iced::Alignment::End
+    };
+    // `Stack` lays every layer at the origin, so the full-size container
+    // positions the thin MouseArea strip on the actual window edge.
+    let space = if horizontal {
+        Space::new()
+            .width(Length::Fill)
+            .height(Length::Fixed(RESIZE_EDGE))
+    } else {
+        Space::new()
+            .width(Length::Fixed(RESIZE_EDGE))
+            .height(Length::Fill)
+    };
+    let area = MouseArea::new(space)
+        .on_press(Message::WinResize(direction))
+        .interaction(interaction);
+    let zone = container(area)
+        .width(Length::Fill)
+        .height(Length::Fill);
+    if horizontal {
+        zone.align_y(align)
+    } else {
+        zone.align_x(align)
+    }
+    .into()
+}
+
+/// Invisible corner square that starts an OS diagonal resize drag.
+fn resize_corner_zone(
+    direction: iced::window::Direction,
+    align_x: iced::Alignment,
+    align_y: iced::Alignment,
+) -> Element<'static, Message> {
+    use iced::mouse::Interaction;
+
+    let interaction = match direction {
+        iced::window::Direction::NorthWest | iced::window::Direction::SouthEast => {
+            Interaction::ResizingDiagonallyDown
+        }
+        _ => Interaction::ResizingDiagonallyUp,
+    };
+    let space = Space::new()
+        .width(Length::Fixed(RESIZE_CORNER))
+        .height(Length::Fixed(RESIZE_CORNER));
+    container(
+        MouseArea::new(space)
+            .on_press(Message::WinResize(direction))
+            .interaction(interaction),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(align_x)
+    .align_y(align_y)
+    .into()
+}
+
+/// Windows-only frameless fix: winit's undecorated windows keep the frame
+/// styles (WS_CAPTION etc.) for aero-snap support while spreading the client
+/// over the non-client area. On some machines DWM bakes a caption-sized
+/// presentation offset from those styles at window creation, which shifts the
+/// rendered surface down while input stays at the true client coordinates
+/// (see rust-windowing/winit#2419, emilk/egui#2770). Stripping the styles is
+/// not enough: DWM only re-lays the composition out after an actual size
+/// change, hence the +1px/-1px nudge at startup.
+#[cfg(target_os = "windows")]
+mod sys {
+    use core::ffi::c_void;
+
+    #[repr(C)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        pub fn GetWindowLongW(hwnd: *mut c_void, index: i32) -> i32;
+        pub fn SetWindowLongW(hwnd: *mut c_void, index: i32, new: i32) -> i32;
+        pub fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        pub fn SetWindowPos(
+            hwnd: *mut c_void,
+            after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    pub const GWL_STYLE: i32 = -16;
+    /// WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX | WS_MAXIMIZEBOX.
+    pub const FRAME_STYLES: i32 = 0x00CF_0000;
+    pub const SWP_NOSIZE: u32 = 0x0001;
+    pub const SWP_NOMOVE: u32 = 0x0002;
+    pub const SWP_NOZORDER: u32 = 0x0004;
+    pub const SWP_NOACTIVATE: u32 = 0x0010;
+    pub const SWP_FRAMECHANGED: u32 = 0x0020;
+
+    /// HWND of an iced window handle (Windows variant).
+    pub fn hwnd_of(window: &dyn iced::window::Window) -> Option<*mut c_void> {
+        use iced::window::raw_window_handle::RawWindowHandle;
+
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return None;
+        };
+        Some(win32.hwnd.get() as *mut c_void)
+    }
+
+    /// Drop the frame styles winit keeps for snap/shake and tell DWM the
+    /// frame changed. Idempotent: only touches the window when any frame
+    /// style bit is still set.
+    pub fn strip(window: &dyn iced::window::Window) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            if style & FRAME_STYLES != 0 {
+                SetWindowLongW(hwnd, GWL_STYLE, style & !FRAME_STYLES);
+                SetWindowPos(
+                    hwnd,
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+
+    /// Resize by `delta` pixels without moving: forces the WM_NCCALCSIZE /
+    /// DWM recomposition that makes the presentation follow the client area.
+    pub fn nudge(window: &dyn iced::window::Window, delta: i32) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        unsafe {
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetWindowRect(hwnd, &mut rect) == 0 {
+                return;
+            }
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            SetWindowPos(
+                hwnd,
+                core::ptr::null_mut(),
+                rect.left,
+                rect.top,
+                width,
+                height + delta,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// Re-assert the frameless style on an existing window (no resize).
+fn enforce_title_frame(id: iced::window::Id) -> Task<Message> {
+    #[cfg(target_os = "windows")]
+    {
+        iced::window::run(id, sys::strip).map(|()| Message::WinFrameChecked)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        Task::none()
+    }
+}
+
+/// Startup-only height nudge so DWM drops the baked caption offset.
+fn nudge_title_frame(id: iced::window::Id, delta: i32) -> Task<Message> {
+    #[cfg(target_os = "windows")]
+    {
+        iced::window::run(id, move |window| sys::nudge(window, delta))
+            .map(|()| Message::WinFrameChecked)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (id, delta);
+        Task::none()
+    }
+}
+
 fn main() -> iced::Result {
+    let window = iced::window::Settings {
+        // Custom title bar: the toolbar row doubles as the window chrome.
+        decorations: false,
+        min_size: Some(iced::Size::new(900.0, 560.0)),
+        ..Default::default()
+    };
+    // Keep `undecorated_shadow` off (it draws a 1px line) and
+    // `corner_preference` default (DWM rounds frameless corners itself).
+    // The DWM caption-offset workaround lives in `enforce_title_frame`.
+
     iced::application(boot, App::update, App::view)
+        .window(window)
         .title("DBStudio")
         .theme(App::theme)
         .subscription(App::subscription)
