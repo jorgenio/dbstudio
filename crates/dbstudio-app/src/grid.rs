@@ -62,7 +62,18 @@ pub fn build(result: QueryResult) -> (VirtualGrid<ResultStore>, Task<grid::Messa
             Box::new(col) as BoxedColumn<GridRow>
         })
         .collect();
-    VirtualGrid::new(store(rows), columns)
+    // Keep the built-in precedence (selected > focus > hover > zebra) but
+    // pin the selection to a solid Navicat-style blue instead of the
+    // palette-derived tint.
+    let (mut grid, init) = VirtualGrid::new(store(rows), columns);
+    grid.set_row_style(|theme, ctx| {
+        let mut style = grid::default_row_style(theme, ctx);
+        if ctx.is_selected {
+            style.background = Some(iced::color!(0xd3e2fb).into());
+        }
+        style
+    });
+    (grid, init)
 }
 
 /// Placeholder grid shown before the first query.

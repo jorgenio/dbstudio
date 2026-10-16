@@ -85,6 +85,20 @@ pub fn tab_active(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Tab whose pane has no content yet (e.g. results before the first run):
+/// framed like an active tab but recessed into the chrome.
+pub fn tab_inactive(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered => Some(color!(0xeceef2).into()),
+            _ => None,
+        },
+        text_color: color!(0x8b919c),
+        border: top_tab_border(),
+        ..Default::default()
+    }
+}
+
 /// Tab border: framed on top and sides, flush with the pane below.
 fn top_tab_border() -> Border {
     let mut border = Border {
@@ -99,15 +113,36 @@ fn top_tab_border() -> Border {
 
 // --- buttons --------------------------------------------------------------
 
-/// Flat chrome button (toolbar / strip actions).
+/// Flat chrome button (toolbar / strip actions); dims when disabled.
 pub fn flat(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered => (Some(color!(0xe8edf5).into()), color!(0x2e3238)),
+        button::Status::Pressed => (Some(color!(0xdde5f2).into()), color!(0x2e3238)),
+        button::Status::Disabled => (None, color!(0xa8aeb8)),
+        button::Status::Active => (None, color!(0x2e3238)),
+    };
     button::Style {
-        background: match status {
-            button::Status::Hovered => Some(color!(0xe8edf5).into()),
-            button::Status::Pressed => Some(color!(0xdde5f2).into()),
-            _ => None,
+        background,
+        text_color,
+        border: Border {
+            radius: 4.0.into(),
+            ..Default::default()
         },
-        text_color: color!(0x2e3238),
+        ..Default::default()
+    }
+}
+
+/// Highlighted navigator row (the connection selected in the sidebar).
+pub fn row_selected(_theme: &Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(
+            match status {
+                button::Status::Hovered => color!(0xd7e3fc),
+                _ => color!(0xe3ecfd),
+            }
+            .into(),
+        ),
+        text_color: color!(0x1d4fd7),
         border: Border {
             radius: 4.0.into(),
             ..Default::default()

@@ -68,6 +68,9 @@ struct App {
     last_columns: Vec<ColumnMeta>,
     /// Displayed row count of the last result set.
     last_row_count: usize,
+    /// Whether a statement has completed at least once this session (drives
+    /// the "Resultado 1" tab's active/dimmed state).
+    executed: bool,
     /// Driver context for bare MongoDB filters ("db.collection"), set when a
     /// collection node is opened in the editor.
     query_context: Option<String>,
@@ -150,6 +153,7 @@ fn boot() -> (App, Task<Message>) {
             expanded: HashSet::new(),
             last_columns: Vec::new(),
             last_row_count: 0,
+            executed: false,
             query_context: None,
             status,
         },
@@ -375,6 +379,7 @@ impl App {
             }
             Message::Executed(Ok(result)) => {
                 let ms = result.elapsed.as_millis();
+                self.executed = true;
                 self.status = if result.is_rows() {
                     format!(
                         "{} filas{} ({ms} ms)",
@@ -538,9 +543,11 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         // ── toolbar ─────────────────────────────────────────────────────
+        // Fixed height: the vertical rule inside the row is a Fill child and
+        // would otherwise stretch the hug-height band unpredictably.
         let toolbar = container(
             row![
-                button(text("Nueva conexión").size(13))
+                button(text("+ Nueva conexión").size(13))
                     .on_press(Message::OpenForm)
                     .style(theme::flat),
                 button(text("Ejecutar (F5)").size(13))
@@ -562,6 +569,7 @@ impl App {
             .padding(8),
         )
         .width(Length::Fill)
+        .height(Length::Fixed(44.0))
         .style(theme::chrome);
 
         // ── navigator: connections + lazy object tree ───────────────────
@@ -595,18 +603,24 @@ impl App {
                 ]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
+                let row_style: fn(&Theme, button::Status) -> button::Style =
+                    if self.selected == Some(i) {
+                        theme::row_selected
+                    } else {
+                        theme::flat
+                    };
                 navigator = navigator.push(
                     button(label)
                         .width(Length::Fill)
                         .on_press(Message::SelectConnection(i))
-                        .style(theme::flat),
+                        .style(row_style),
                 );
             }
             if let Some(root) = &self.root {
                 navigator = push_tree(self, root, 0, navigator);
             }
         }
-        let navigator = container(scrollable(navigator).height(Length::Fill).anchor_bottom())
+        let navigator = container(scrollable(navigator).height(Length::Fill))
             .width(Length::Fixed(260.0))
             .height(Length::Fill)
             .padding(6)
@@ -627,22 +641,29 @@ impl App {
             .style(theme::workspace);
 
         // ── result strip: tab + row count + copy actions ────────────────
+        let has_results = !self.last_columns.is_empty();
+        let result_tab_style: fn(&Theme, button::Status) -> button::Style =
+            if self.executed {
+                theme::tab_active
+            } else {
+                theme::tab_inactive
+            };
         let result_strip = container(
             row![
-                button(text("  Resultado 1  ").size(13)).style(theme::tab_active),
+                button(text("  Resultado 1  ").size(13)).style(result_tab_style),
                 text(format!("{} filas", self.last_row_count))
                     .size(12)
                     .color(theme::muted()),
                 container(
                     row![
                         button(text("Copiar").size(12))
-                            .on_press(Message::CopyValues)
+                            .on_press_maybe(has_results.then_some(Message::CopyValues))
                             .style(theme::flat),
                         button(text("Copiar c/nombres").size(12))
-                            .on_press(Message::CopyWithHeaders)
+                            .on_press_maybe(has_results.then_some(Message::CopyWithHeaders))
                             .style(theme::flat),
                         button(text("Exportar…").size(12))
-                            .on_press(Message::Export)
+                            .on_press_maybe(has_results.then_some(Message::Export))
                             .style(theme::flat),
                     ]
                     .spacing(6)
@@ -674,16 +695,21 @@ impl App {
         ];
 
         // ── status bar: message left, live connection right ─────────────
-        let conn_label = self
+        let (conn_label, conn_color) = self
             .active_id
             .and_then(|id| self.entries.iter().find(|e| e.cfg.id == id))
-            .map(|e| format!("● {} · {}", e.cfg.engine, e.cfg.name))
-            .unwrap_or_else(|| "sin conexión".to_string());
+            .map(|e| {
+                (
+                    format!("● {} · {}", e.cfg.engine, e.cfg.name),
+                    theme::engine_color(e.cfg.engine),
+                )
+            })
+            .unwrap_or_else(|| ("○ sin conexión".to_string(), theme::muted()));
         let status_bar = container(
             row![
                 text(format!(" {}", self.status)).size(12),
                 container(
-                    row![text(conn_label).size(12).color(theme::muted())]
+                    row![text(conn_label).size(12).color(conn_color)]
                         .align_y(iced::Alignment::Center),
                 )
                 .width(Length::Fill)
@@ -844,6 +870,7 @@ fn push_tree<'a>(
         col = col.push(
             button(text(format!("{pad}{marker} {}", node.label)).size(13))
                 .width(Length::Fill)
+                .style(theme::flat)
                 .on_press(press),
         );
         if is_open {
