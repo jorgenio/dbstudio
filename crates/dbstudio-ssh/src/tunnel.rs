@@ -215,9 +215,50 @@ async fn authenticate(handle: &mut Handle<VerifyHandler>, cfg: &SshConfig) -> Re
         }
 
         SshAuth::Agent => {
-            return Err(Error::Auth(
-                "SSH agent auth is not implemented yet; use a key file or password".into(),
-            ));
+            let mut agent = connect_agent().await?;
+            let identities = agent
+                .request_identities()
+                .await
+                .map_err(|e| Error::Auth(format!("ssh-agent: {e}")))?;
+            let rsa_hash = match handle.best_supported_rsa_hash().await {
+                Ok(Some(alg)) => alg,
+                Ok(None) | Err(_) => Some(keys::HashAlg::Sha256),
+            };
+            // Try each plain public key the agent holds; certificates are
+            // skipped (use a key file for those).
+            let mut last_agent_err = None;
+            let mut authenticated = false;
+            for identity in identities {
+                let keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
+                    continue;
+                };
+                let hash_alg = match key.algorithm() {
+                    keys::Algorithm::Ed25519 => None,
+                    _ => rsa_hash,
+                };
+                match handle
+                    .authenticate_publickey_with(user, key, hash_alg, &mut agent)
+                    .await
+                {
+                    Ok(client::AuthResult::Success) => {
+                        authenticated = true;
+                        break;
+                    }
+                    Ok(client::AuthResult::Failure { .. }) => {}
+                    Err(e) => last_agent_err = Some(e),
+                }
+            }
+            if authenticated {
+                client::AuthResult::Success
+            } else {
+                return Err(match last_agent_err {
+                    Some(e) => Error::Auth(format!("ssh-agent auth failed: {e}")),
+                    None => Error::Auth(
+                        "ssh-agent: no key was accepted (try ssh-add, or allow the key on the server)"
+                            .into(),
+                    ),
+                });
+            }
         }
     };
 
@@ -229,5 +270,57 @@ async fn authenticate(handle: &mut Handle<VerifyHandler>, cfg: &SshConfig) -> Re
         } => Err(Error::Auth(format!(
             "SSH authentication denied (partial={partial_success}, remaining={remaining_methods:?})"
         ))),
+    }
+}
+
+/// Type-erased agent client (the concrete stream differs per platform).
+type AgentHandle = keys::agent::client::AgentClient<
+    Box<dyn keys::agent::client::AgentStream + Send + Unpin + 'static>,
+>;
+
+/// Connect to the platform's SSH agent: `SSH_AUTH_SOCK` on Unix, then the
+/// Windows OpenSSH named pipe, then Pageant.
+async fn connect_agent() -> Result<AgentHandle> {
+    use keys::agent::client::AgentClient;
+
+    #[cfg(unix)]
+    if std::env::var("SSH_AUTH_SOCK").is_ok() {
+        match AgentClient::connect_env().await {
+            Ok(agent) => return Ok(agent.dynamic()),
+            Err(e) => tracing::debug!("SSH_AUTH_SOCK agent unavailable: {e}"),
+        }
+    }
+    #[cfg(windows)]
+    {
+        const WIN_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+        match AgentClient::connect_named_pipe(WIN_PIPE).await {
+            Ok(agent) => return Ok(agent.dynamic()),
+            Err(e) => tracing::debug!("Windows ssh-agent pipe unavailable: {e}"),
+        }
+        match AgentClient::connect_pageant().await {
+            Ok(agent) => return Ok(agent.dynamic()),
+            Err(e) => tracing::debug!("Pageant agent unavailable: {e}"),
+        }
+    }
+    Err(Error::Auth(
+        "no SSH agent found (SSH_AUTH_SOCK, Windows OpenSSH agent, or Pageant)".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_connect_falls_back_cleanly() {
+        // On machines without an agent this must be a clean, actionable
+        // error; with an agent present, just connecting is enough.
+        match connect_agent().await {
+            Ok(_) => {}
+            Err(e) => assert!(
+                e.to_string().contains("agent"),
+                "unexpected error shape: {e}"
+            ),
+        }
     }
 }

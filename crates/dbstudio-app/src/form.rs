@@ -33,16 +33,16 @@ pub enum FormMsg {
     Cancel,
 }
 
-/// How the SSH tunnel authenticates. The agent method is omitted from the UI
-/// until the tunnel implements it.
+/// How the SSH tunnel authenticates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshAuthKind {
     Password,
     Key,
+    Agent,
 }
 
 impl SshAuthKind {
-    pub const ALL: [SshAuthKind; 2] = [SshAuthKind::Password, SshAuthKind::Key];
+    pub const ALL: [SshAuthKind; 3] = [SshAuthKind::Password, SshAuthKind::Key, SshAuthKind::Agent];
 }
 
 impl fmt::Display for SshAuthKind {
@@ -50,6 +50,7 @@ impl fmt::Display for SshAuthKind {
         f.write_str(match self {
             SshAuthKind::Password => "Contraseña",
             SshAuthKind::Key => "Clave privada",
+            SshAuthKind::Agent => "Agente SSH",
         })
     }
 }
@@ -243,6 +244,7 @@ impl ConnForm {
                         .then(|| SecretString::new(self.ssh_passphrase.clone())),
                 }
             }
+            SshAuthKind::Agent => SshAuth::Agent,
         };
         let mut ssh = SshConfig::new(host, username);
         ssh.port = port;
@@ -331,6 +333,13 @@ fn ssh_section<'a>(form: &ConnForm) -> Element<'a, FormMsg> {
             ),
         ]
         .spacing(6)
+        .into(),
+        SshAuthKind::Agent => text(
+            "Se usarán las llaves del agente del sistema (SSH_AUTH_SOCK, \
+             agente de OpenSSH en Windows o Pageant). Añade llaves con «ssh-add».",
+        )
+        .size(11)
+        .color(theme::muted())
         .into(),
     };
 
