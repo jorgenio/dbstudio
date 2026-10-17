@@ -1,4 +1,4 @@
-//! DBStudio: three-pane desktop client. The navigator holds saved
+//! jorgenio dbstudio: three-pane desktop client. The navigator holds saved
 //! connections plus a lazy object tree backed by a live driver session; the
 //! editor runs statements through `dbstudio-drivers` and the result grid is
 //! rebuilt from the driver's normalized `QueryResult`.
@@ -19,7 +19,7 @@ use dbstudio_core::{
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
 use store::Connections;
-use iced::widget::{button, container, row, rule, scrollable, stack, text, Column, MouseArea, Space};
+use iced::widget::{button, column, container, row, rule, scrollable, stack, text, Column, MouseArea, Space};
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
 use iced_code_editor::{CodeEditor, Message as EditorMessage};
@@ -74,6 +74,15 @@ struct App {
     /// Driver context for bare MongoDB filters ("db.collection"), set when a
     /// collection node is opened in the editor.
     query_context: Option<String>,
+    /// SQL completion popup state (prefix being typed + filtered candidates).
+    completion: Completion,
+    /// Cached table/column dictionaries per connection (populated eagerly in
+    /// the background after each connect).
+    completion_words: HashMap<ConnectionId, Vec<String>>,
+    /// Dark chrome active? (persisted in settings.json).
+    dark: bool,
+    /// Entry index being edited in the connection form (None = creating new).
+    editing: Option<usize>,
     status: String,
     /// Id of the main window; set once the window is open (the frameless
     /// title bar needs it to drag/minimize/close the window).
@@ -129,19 +138,125 @@ enum Message {
     WinNudgeTitle(bool),
     /// `iced::window::run` completion marker (no-op).
     WinFrameChecked,
+    /// A table/column dictionary finished loading in the background; `id` is
+    /// the connection it belongs to (may no longer be the active one).
+    CompletionWordsLoaded(ConnectionId, Vec<String>),
+    /// A suggestion row in the completion popup was clicked.
+    CompletionAccept(usize),
+    /// Ctrl+Space pressed: open the popup manually (empty prefix = list).
+    CompletionTrigger,
+    /// Esc pressed while the completion popup is open.
+    CompletionClose,
+    /// Switch between the light and dark chrome (persisted).
+    ToggleTheme,
+    /// Open the connection form pre-filled with the selected entry.
+    EditSelected,
+    /// The background test finished; Ok carries a short success blurb.
+    Tested(Result<String, String>),
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
 
+/// SQL completion popup: the word being typed, the dictionary it filters and
+/// the highlighted candidate. The dictionary is loaded once per connection by
+/// `load_completion_words`.
+#[derive(Default)]
+struct Completion {
+    /// Table/column/view words for the active connection.
+    dictionary: Vec<String>,
+    /// Characters typed after the last word boundary.
+    prefix: String,
+    /// Candidates matching `prefix` (case-insensitive, capped).
+    items: Vec<String>,
+    /// Index highlighted in the popup.
+    selected: usize,
+    open: bool,
+}
+
+impl Completion {
+    /// Characters that extend the current word ("SELECT usu|").
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '.'
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.prefix.push(c);
+        self.recompute();
+    }
+
+    fn pop_char(&mut self) {
+        self.prefix.pop();
+        self.recompute();
+    }
+
+    /// Discard the tracked prefix (cursor moved, mouse click, etc.).
+    fn invalidate(&mut self) {
+        self.prefix.clear();
+        self.close();
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.items.clear();
+        self.selected = 0;
+    }
+
+    /// Open with the whole dictionary (Ctrl+Space with no prefix).
+    fn open_all(&mut self) {
+        if self.dictionary.is_empty() {
+            self.close();
+            return;
+        }
+        self.items = self.dictionary.iter().take(50).cloned().collect();
+        self.selected = 0;
+        self.open = true;
+    }
+
+    fn recompute(&mut self) {
+        if self.prefix.is_empty() {
+            self.close();
+            return;
+        }
+        let needle = self.prefix.to_lowercase();
+        self.items = self
+            .dictionary
+            .iter()
+            .filter(|w| w.to_lowercase().starts_with(&needle))
+            .take(50)
+            .cloned()
+            .collect();
+        self.selected = 0;
+        self.open = !self.items.is_empty();
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1).min(self.items.len() - 1);
+        }
+    }
+
+    fn selected_word(&self) -> Option<&str> {
+        self.items.get(self.selected).map(String::as_str)
+    }
+}
+
 fn boot() -> (App, Task<Message>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+    let settings = store::load_settings();
+    let dark = settings.theme_dark;
+
     // Derive the editor palette from the app theme so the code pane matches
-    // the light chrome, then lift the surfaces to pure white.
+    // the chrome, then lift the surfaces to pure white (light) / slate (dark).
     let mut editor = CodeEditor::new(SAMPLE_SQL, "sql");
-    let mut editor_style = iced_code_editor::from_iced_theme(&theme::app_theme());
-    editor_style.background = iced::color!(0xffffff);
-    editor_style.gutter_background = iced::color!(0xfafbfd);
+    let mut editor_style = iced_code_editor::from_iced_theme(&theme::app_theme(dark));
+    let palette = theme::editor_palette(dark);
+    editor_style.background = palette.background;
+    editor_style.gutter_background = palette.gutter_background;
     editor.set_theme(editor_style);
 
     // Saved connections: configs from disk, passwords from the keyring.
@@ -181,6 +296,10 @@ fn boot() -> (App, Task<Message>) {
             last_row_count: 0,
             executed: false,
             query_context: None,
+            completion: Completion::default(),
+            completion_words: HashMap::new(),
+            dark,
+            editing: None,
             status,
             window_id: None,
             last_title_press: None,
@@ -210,6 +329,31 @@ fn connect_task(rt: Arc<tokio::runtime::Runtime>, cfg: ConnectionConfig) -> Task
             res.map(|(session, children)| (id, session, root_reply, children))
         },
         Message::Connected,
+    )
+}
+
+/// "Probar" in the form: handshake + ping + drop, nothing saved.
+fn test_task(rt: Arc<tokio::runtime::Runtime>, cfg: ConnectionConfig) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let session = drivers::connect(&cfg).await.map_err(|e| e.to_string())?;
+                session
+                    .client
+                    .ping()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let host = if cfg.ssh.is_some() {
+                    format!("{} (vía SSH)", cfg.host)
+                } else {
+                    cfg.host.clone()
+                };
+                Ok::<_, String>(format!("test OK: {} → {host}:{}", cfg.name, cfg.port))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::Tested,
     )
 }
 
@@ -248,11 +392,77 @@ impl App {
         }
     }
 
+    /// Replace the tracked word with the highlighted candidate: erase the
+    /// typed prefix with synthetic Backspaces, then insert the word char by
+    /// char. Both go straight to the editor (not through `update`), so the
+    /// completion interception never sees them.
+    fn accept_completion(&mut self) -> Task<Message> {
+        let Some(word) = self.completion.selected_word().map(str::to_owned) else {
+            return Task::none();
+        };
+        for _ in 0..self.completion.prefix.chars().count() {
+            let _ = self.editor.update(&EditorMessage::Backspace);
+        }
+        for ch in word.chars() {
+            let _ = self.editor.update(&EditorMessage::CharacterInput(ch));
+        }
+        // The old prefix is gone (we just rewrote it); track from scratch.
+        self.completion.invalidate();
+        Task::none()
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(msg) => {
-                let _ = self.editor.update(&msg);
-                Task::none()
+                use iced_code_editor::ArrowDirection as Dir;
+                match &msg {
+                    // Typing extends the word and refilters the candidates.
+                    EditorMessage::CharacterInput(c) if Completion::is_word_char(*c) => {
+                        self.completion.push_char(*c);
+                        let _ = self.editor.update(&msg);
+                        Task::none()
+                    }
+                    // A non-word char (space, paren, …) ends the word.
+                    EditorMessage::CharacterInput(_) => {
+                        self.completion.invalidate();
+                        let _ = self.editor.update(&msg);
+                        Task::none()
+                    }
+                    // Tab/Enter accept the highlighted candidate instead of
+                    // indenting / inserting a newline.
+                    EditorMessage::Tab if self.completion.open => self.accept_completion(),
+                    EditorMessage::Enter if self.completion.open => self.accept_completion(),
+                    // Up/Down navigate the popup without moving the cursor.
+                    EditorMessage::ArrowKey(Dir::Up, false) if self.completion.open => {
+                        self.completion.move_up();
+                        Task::none()
+                    }
+                    EditorMessage::ArrowKey(Dir::Down, false) if self.completion.open => {
+                        self.completion.move_down();
+                        Task::none()
+                    }
+                    // Any other cursor movement invalidates the tracked word.
+                    EditorMessage::Backspace => {
+                        self.completion.pop_char();
+                        let _ = self.editor.update(&msg);
+                        Task::none()
+                    }
+                    EditorMessage::Delete
+                    | EditorMessage::MouseClick(_)
+                    | EditorMessage::ArrowKey(..)
+                    | EditorMessage::Home(_)
+                    | EditorMessage::End(_)
+                    | EditorMessage::PageUp(_)
+                    | EditorMessage::PageDown(_) => {
+                        self.completion.invalidate();
+                        let _ = self.editor.update(&msg);
+                        Task::none()
+                    }
+                    _ => {
+                        let _ = self.editor.update(&msg);
+                        Task::none()
+                    }
+                }
             }
             Message::Grid(msg) => self.grid.update(msg).map(Message::Grid),
             Message::SearchInput(text) => {
@@ -346,10 +556,61 @@ impl App {
             }
             Message::OpenForm => {
                 self.form = Some(ConnForm::default());
+                self.editing = None;
+                Task::none()
+            }
+            Message::EditSelected => {
+                let Some(i) = self.selected else {
+                    return Task::none();
+                };
+                let Some(entry) = self.entries.get(i) else {
+                    return Task::none();
+                };
+                self.form = Some(ConnForm::from_cfg(&entry.cfg));
+                self.editing = Some(i);
+                Task::none()
+            }
+            Message::ToggleTheme => {
+                self.dark = !self.dark;
+                let palette = theme::editor_palette(self.dark);
+                let mut editor_style =
+                    iced_code_editor::from_iced_theme(&theme::app_theme(self.dark));
+                editor_style.background = palette.background;
+                editor_style.gutter_background = palette.gutter_background;
+                self.editor.set_theme(editor_style);
+                store::save_settings(&store::Settings {
+                    theme_dark: self.dark,
+                });
+                Task::none()
+            }
+            Message::Form(FormMsg::Test) => {
+                // "Probar": build a config from the live fields and dial it in
+                // the background without touching the saved list.
+                let Some(form) = &self.form else {
+                    return Task::none();
+                };
+                match form.build() {
+                    Ok(cfg) => {
+                        self.status = format!("probando {}…", cfg.name);
+                        test_task(self.rt.clone(), cfg)
+                    }
+                    Err(e) => {
+                        self.status = format!("error: {e}");
+                        Task::none()
+                    }
+                }
+            }
+            Message::Tested(Ok(blurb)) => {
+                self.status = format!("✓ {blurb}");
+                Task::none()
+            }
+            Message::Tested(Err(e)) => {
+                self.status = format!("✗ test falló: {e}");
                 Task::none()
             }
             Message::Form(FormMsg::Cancel) => {
                 self.form = None;
+                self.editing = None;
                 Task::none()
             }
             Message::Form(FormMsg::Submit) => {
@@ -357,17 +618,38 @@ impl App {
                     return Task::none();
                 };
                 match form.build() {
-                    Ok(cfg) => {
-                        self.entries.push(ConnEntry {
-                            cfg: cfg.clone(),
-                            state: ConnState::Connecting,
-                        });
-                        self.selected = Some(self.entries.len() - 1);
-                        self.search_text = cfg.name.clone();
-                        self.refresh_search();
-                        self.persist();
-                        self.status = format!("conectando a {}…", cfg.name);
-                        connect_task(self.rt.clone(), cfg)
+                    Ok(mut cfg) => {
+                        if let Some(i) = self.editing.take() {
+                            // Keep identity and in-place the entry; an old
+                            // live session for it is stale and gets dropped.
+                            let old = &self.entries[i].cfg;
+                            cfg.id = old.id;
+                            if self.active_id == Some(cfg.id) {
+                                self.session = None;
+                                self.active_id = None;
+                                self.root = None;
+                                self.tree.clear();
+                                self.expanded.clear();
+                                self.query_context = None;
+                            }
+                            self.entries[i].cfg = cfg.clone();
+                            self.entries[i].state = ConnState::Connecting;
+                            self.selected = Some(i);
+                            self.persist();
+                            self.status = format!("guardada — conectando a {}…", cfg.name);
+                            connect_task(self.rt.clone(), cfg)
+                        } else {
+                            self.entries.push(ConnEntry {
+                                cfg: cfg.clone(),
+                                state: ConnState::Connecting,
+                            });
+                            self.selected = Some(self.entries.len() - 1);
+                            self.search_text = cfg.name.clone();
+                            self.refresh_search();
+                            self.persist();
+                            self.status = format!("conectando a {}…", cfg.name);
+                            connect_task(self.rt.clone(), cfg)
+                        }
                     }
                     Err(e) => {
                         self.form = Some(form);
@@ -395,14 +677,24 @@ impl App {
                 self.expanded.clear();
                 self.expanded.insert(root.clone());
                 self.query_context = None;
-                self.root = Some(root);
+                self.completion.close();
+                self.completion.dictionary = self
+                    .completion_words
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.root = Some(root.clone());
+                let load_session = session.clone();
                 self.session = Some(session);
                 self.active_id = Some(id);
                 self.status = match self.entries.iter().find(|e| e.cfg.id == id) {
                     Some(e) => format!("conectada: {} ({})", e.cfg.name, e.cfg.engine),
                     None => "conectada".to_string(),
                 };
-                Task::none()
+                Task::perform(
+                    load_completion_words(load_session, root),
+                    move |words| Message::CompletionWordsLoaded(id, words),
+                )
             }
             Message::Connected(Err(e)) => {
                 if let Some(entry) = self
@@ -426,6 +718,7 @@ impl App {
                     _ => None,
                 };
                 let expand = self.expand(&obj);
+                self.completion.close();
                 let edit = self.editor.reset(&sql).map(Message::Editor);
                 Task::batch([expand, edit])
             }
@@ -435,6 +728,33 @@ impl App {
             }
             Message::ChildrenLoaded(_parent, Err(e)) => {
                 self.status = format!("error al listar objetos: {e}");
+                Task::none()
+            }
+            Message::CompletionWordsLoaded(id, words) => {
+                let n = words.len();
+                if self.active_id == Some(id) {
+                    self.completion.dictionary = words.clone();
+                    self.status = format!("conexión lista (autocompletado: {n} objetos)");
+                }
+                self.completion_words.insert(id, words);
+                Task::none()
+            }
+            Message::CompletionAccept(index) => {
+                if index < self.completion.items.len() {
+                    self.completion.selected = index;
+                    self.accept_completion()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CompletionTrigger => {
+                self.completion.open_all();
+                Task::none()
+            }
+            Message::CompletionClose => {
+                if self.completion.open {
+                    self.completion.close();
+                }
                 Task::none()
             }
             Message::Executed(Ok(result)) => {
@@ -710,13 +1030,16 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         let toolbar = row![
-            text("DBStudio").size(14),
+            text("jorgenio dbstudio").size(14),
             button(text("+ Nueva conexión").size(13))
                 .on_press(Message::OpenForm)
                 .style(theme::flat),
             button(text("Ejecutar (F5)").size(13))
                 .on_press(Message::Run)
                 .style(theme::solid),
+            button(text(if self.dark { "☾ claro" } else { "☀ oscuro" }).size(13))
+                .on_press(Message::ToggleTheme)
+                .style(theme::flat),
             rule::vertical(1).style(theme::hairline),
             container(auto_complete(
                 &self.search,
@@ -759,9 +1082,15 @@ impl App {
         if self.selected.is_some() && self.form.is_none() {
             conn_header = conn_header.push(
                 container(
-                    button(text("✕ Eliminar").size(11))
-                        .on_press(Message::DeleteSelected)
-                        .style(theme::flat),
+                    row![
+                        button(text("✎ Editar").size(11))
+                            .on_press(Message::EditSelected)
+                            .style(theme::flat),
+                        button(text("✕ Eliminar").size(11))
+                            .on_press(Message::DeleteSelected)
+                            .style(theme::flat),
+                    ]
+                    .spacing(4),
                 )
                 .width(Length::Fill)
                 .align_x(iced::Alignment::End),
@@ -776,7 +1105,7 @@ impl App {
         );
         if let Some(form) = &self.form {
             navigator = navigator.push(
-                container(form::view(form).map(Message::Form))
+                container(form::view(form, self.editing.is_some()).map(Message::Form))
                     .padding(6)
                     .style(theme::workspace),
             );
@@ -825,7 +1154,17 @@ impl App {
         .width(Length::Fill)
         .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
         .style(theme::chrome);
-        let editor = container(self.editor.view().map(Message::Editor))
+        // The completion popup floats over the editor (bottom-left); when
+        // closed the overlay is an inert empty space.
+        let editor_layers: Vec<Element<Message>> = vec![
+            self.editor.view().map(Message::Editor).into(),
+            if self.completion.open {
+                completion_popup(&self.completion)
+            } else {
+                Element::from(Space::new())
+            },
+        ];
+        let editor = container(stack(editor_layers))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(6)
@@ -988,6 +1327,20 @@ impl App {
                 iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete) => {
                     Some(Message::DeleteSelected)
                 }
+                // Ctrl+Space opens the completion popup (the editor declines
+                // the combo, so it reaches this global listener).
+                iced::keyboard::Key::Character(ref c)
+                    if control && !modifiers.shift() && c.as_ref() == " " =>
+                {
+                    Some(Message::CompletionTrigger)
+                }
+                // Esc closes the popup (same reasoning as F5: declined by the
+                // editor, seen here when the popup is open).
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                    if modifiers.is_empty() =>
+                {
+                    Some(Message::CompletionClose)
+                }
                 _ => None,
             }
         });
@@ -999,7 +1352,7 @@ impl App {
     }
 
     fn theme(&self) -> Theme {
-        theme::app_theme()
+        theme::app_theme(self.dark)
     }
 }
 
@@ -1341,15 +1694,158 @@ fn main() -> iced::Result {
 
     iced::application(boot, App::update, App::view)
         .window(window)
-        .title("DBStudio")
+        .title("jorgenio dbstudio")
         .theme(App::theme)
         .subscription(App::subscription)
         .run()
 }
 
+/// Floating suggestion list anchored at the editor's bottom-left corner.
+fn completion_popup(completion: &Completion) -> Element<'_, Message> {
+    let rows = completion
+        .items
+        .iter()
+        .enumerate()
+        .fold(Column::new().spacing(0), |col, (i, word)| {
+            col.push(
+                button(text(word).size(13))
+                    .on_press(Message::CompletionAccept(i))
+                    .width(Length::Fill)
+                    .style(if i == completion.selected {
+                        theme::completion_selected
+                    } else {
+                        theme::completion_item
+                    }),
+            )
+        });
+    let panel = container(
+        column![
+            text(format!(
+                "{} sugerencias · Tab/Enter acepta · Esc cierra",
+                completion.items.len()
+            ))
+            .size(11)
+            .color(theme::muted()),
+            scrollable(rows).height(Length::Fixed(200.0)),
+        ]
+        .padding(8)
+        .spacing(6)
+        .max_width(320.0),
+    )
+    .style(theme::completion_popup)
+    .padding(4);
+    // `Stack` lays every layer at the origin; a full-size wrapper anchors
+    // the panel at the editor's bottom-left corner.
+    container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Start)
+        .align_y(iced::Alignment::End)
+        .padding(iced::Padding { top: 0.0, right: 0.0, bottom: 8.0, left: 8.0 })
+        .into()
+}
+
+/// Walk the object tree in the background and collect every table/view/
+/// collection and column label into a completion dictionary. One query per
+/// container (database/schema/table), so even a few hundred tables only cost
+/// a few hundred roundtrips — done off the UI thread after connecting.
+async fn load_completion_words(session: Arc<Session>, root: ObjectRef) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut stack = vec![root];
+    let mut visited = HashSet::new();
+    while let Some(parent) = stack.pop() {
+        if !visited.insert(parent.clone()) {
+            continue;
+        }
+        let Ok(children) = session.client.list_children(&parent).await else {
+            continue;
+        };
+        for node in children {
+            match node.kind {
+                ObjectKind::Database | ObjectKind::Schema => {
+                    stack.push(node.object);
+                }
+                ObjectKind::Table => {
+                    words.push(node.label);
+                    stack.push(node.object);
+                }
+                ObjectKind::Column | ObjectKind::View | ObjectKind::Collection => {
+                    words.push(node.label);
+                }
+                _ => {}
+            }
+        }
+    }
+    words.sort();
+    words.dedup();
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_filters_case_insensitively() {
+        let mut c = Completion {
+            dictionary: vec!["usuarios".into(), "user_roles".into(), "pedidos".into()],
+            ..Default::default()
+        };
+        c.push_char('U');
+        c.push_char('s');
+        assert!(c.open);
+        assert_eq!(c.items.len(), 2, "usuarios y user_roles empiezan por us");
+        c.push_char('u');
+        assert_eq!(c.items, vec!["usuarios".to_string()]);
+        assert_eq!(c.selected_word(), Some("usuarios"));
+    }
+
+    #[test]
+    fn completion_closes_on_no_match_and_reopens() {
+        let mut c = Completion {
+            dictionary: vec!["usuarios".into()],
+            ..Default::default()
+        };
+        c.push_char('z');
+        assert!(!c.open);
+        c.pop_char();
+        c.push_char('u');
+        assert!(c.open);
+    }
+
+    #[test]
+    fn completion_prefix_is_capped_and_navigable() {
+        let mut c = Completion {
+            dictionary: (0..60).map(|i| format!("tabla_{i:02}")).collect(),
+            ..Default::default()
+        };
+        c.push_char('t');
+        assert_eq!(c.items.len(), 50);
+        c.move_down();
+        assert_eq!(c.selected, 1);
+        c.move_up();
+        c.move_up();
+        assert_eq!(c.selected, 0);
+    }
+
+    #[test]
+    fn completion_open_all_lists_up_to_fifty() {
+        let mut c = Completion {
+            dictionary: (0..80).map(|i| format!("w{i}")).collect(),
+            ..Default::default()
+        };
+        c.open_all();
+        assert!(c.open);
+        assert_eq!(c.items.len(), 50);
+    }
+
+    #[test]
+    fn completion_open_all_with_empty_dictionary_stays_closed() {
+        let mut c = Completion::default();
+        c.open_all();
+        assert!(!c.open);
+        assert!(c.items.is_empty());
+    }
 
     fn obj(path: &[&str]) -> ObjectRef {
         ObjectRef {

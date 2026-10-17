@@ -5,6 +5,50 @@ use std::path::PathBuf;
 
 use dbstudio_core::{ConnectionConfig, SecretString, SshAuth};
 use dbstudio_secrets::SecretStore;
+use serde::{Deserialize, Serialize};
+
+/// App-level settings stored next to `connections.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub theme_dark: bool,
+}
+
+fn settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dbstudio")
+        .join("settings.json")
+}
+
+/// Load persisted app settings; defaults (light theme) on any problem.
+pub fn load_settings() -> Settings {
+    load_settings_from(&settings_path())
+}
+
+/// Persist app settings (best-effort; callers may ignore errors).
+pub fn save_settings(settings: &Settings) {
+    save_settings_to(&settings_path(), settings);
+}
+
+/// Same as [`load_settings`] but from an explicit path (tests).
+pub fn load_settings_from(path: &std::path::Path) -> Settings {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Same as [`save_settings`] but to an explicit path (tests).
+pub fn save_settings_to(path: &std::path::Path, settings: &Settings) {
+    let Ok(json) = serde_json::to_string_pretty(settings) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
 
 pub struct Connections {
     path: PathBuf,
@@ -173,5 +217,27 @@ mod tests {
 
         let _ = std::fs::remove_file(conn_path);
         let _ = std::fs::remove_file(sec_path);
+    }
+
+    #[test]
+    fn settings_theme_roundtrips_and_defaults_to_light() {
+        let path =
+            std::env::temp_dir().join(format!("dbstudio-test-settings-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file → defaults (light).
+        assert!(!load_settings_from(&path).theme_dark);
+
+        save_settings_to(&path, &Settings { theme_dark: true });
+        assert!(load_settings_from(&path).theme_dark);
+
+        save_settings_to(&path, &Settings { theme_dark: false });
+        assert!(!load_settings_from(&path).theme_dark);
+
+        // Corrupt file → defaults again, no panic.
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(!load_settings_from(&path).theme_dark);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

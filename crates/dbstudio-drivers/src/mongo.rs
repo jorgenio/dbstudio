@@ -13,7 +13,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use dbstudio_core::{
     CellValue, ColumnMeta, ConnectionConfig, DataType, Engine, Error, ExecuteRequest, ObjectKind,
-    ObjectNode, ObjectRef, QueryResult, Result, TypeFamily,
+    ObjectNode, ObjectRef, QueryResult, Result, TypeFamily, TlsMode,
 };
 use dbstudio_ssh::Tunnel;
 use futures::StreamExt;
@@ -51,13 +51,39 @@ pub async fn connect(
     uri.push_str(&port.to_string());
     uri.push('/');
     uri.push_str(&cfg.database);
-    if cfg.tls.wants_tls() && tunnel.is_none() {
-        uri.push_str("?tls=true");
-    }
 
-    let client = Client::with_uri_str(&uri)
-        .await
-        .map_err(|e| Error::Connection(format!("mongodb: {e}")))?;
+    let want_tls = cfg.tls.wants_tls() && tunnel.is_none();
+    let client = if want_tls {
+        // Bounded server-selection so the probe below can't hang 30s.
+        let tls_uri = format!("{uri}?tls=true&serverSelectionTimeoutMS=5000");
+        let client = Client::with_uri_str(&tls_uri)
+            .await
+            .map_err(|e| Error::Connection(format!("mongodb: {e}")))?;
+        if cfg.tls == TlsMode::Prefer {
+            // The driver is lazy: force the handshake now, so a failed TLS
+            // attempt (server without TLS, self-signed cert) can fall back to
+            // cleartext like sslmode=prefer does for the SQL engines.
+            let probe = client
+                .database("admin")
+                .run_command(bson::doc! { "ping": 1 })
+                .await;
+            match probe {
+                Ok(_) => client,
+                Err(e) => {
+                    tracing::warn!("mongodb: TLS probe failed ({e}); retrying without TLS (mode=prefer)");
+                    Client::with_uri_str(&uri)
+                        .await
+                        .map_err(|e| Error::Connection(format!("mongodb: {e}")))?
+                }
+            }
+        } else {
+            client
+        }
+    } else {
+        Client::with_uri_str(&uri)
+            .await
+            .map_err(|e| Error::Connection(format!("mongodb: {e}")))?
+    };
 
     Ok(Arc::new(MongoClient {
         client,

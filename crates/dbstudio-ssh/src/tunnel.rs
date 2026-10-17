@@ -195,10 +195,18 @@ async fn connect_session(cfg: &SshConfig) -> Result<Handle<VerifyHandler>> {
 async fn authenticate(handle: &mut Handle<VerifyHandler>, cfg: &SshConfig) -> Result<()> {
     let user = cfg.username.as_str();
     let auth_result = match &cfg.auth {
-        SshAuth::Password { password } => handle
-            .authenticate_password(user, password.expose())
-            .await
-            .map_err(|e| Error::Auth(format!("SSH password auth failed: {e}")))?,
+        SshAuth::Password { password } => {
+            let pw = password.expose();
+            match handle.authenticate_password(user, pw).await {
+                Ok(client::AuthResult::Success) => client::AuthResult::Success,
+                // Hardened servers (PAM, bastions, cloud images) often disable
+                // the plain "password" method and only offer keyboard-
+                // interactive; retry with the same secret before giving up.
+                Ok(client::AuthResult::Failure { .. }) | Err(_) => {
+                    keyboard_interactive_auth(handle, user, pw).await?
+                }
+            }
+        }
 
         SshAuth::PrivateKey { path, passphrase } => {
             let key = load_secret_key(path, passphrase.as_ref().map(|p| p.expose()))
@@ -271,6 +279,54 @@ async fn authenticate(handle: &mut Handle<VerifyHandler>, cfg: &SshConfig) -> Re
             "SSH authentication denied (partial={partial_success}, remaining={remaining_methods:?})"
         ))),
     }
+}
+
+/// Keyboard-interactive exchange using the same password for every prompt.
+/// Servers may send several rounds (MFA banners, re-prompts); we answer until
+/// Success/Failure or a safety cap, and surface the server's own messages.
+async fn keyboard_interactive_auth(
+    handle: &mut Handle<VerifyHandler>,
+    user: &str,
+    password: &str,
+) -> Result<client::AuthResult> {
+    use client::KeyboardInteractiveAuthResponse as Reply;
+
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(user, None::<String>)
+        .await
+        .map_err(|e| Error::Auth(format!("SSH keyboard-interactive failed: {e}")))?;
+
+    // Bounded rounds: real servers stop after 1–2 prompts unless MFA is on
+    // (which we cannot satisfy blindly, so the cap turns it into a clear error).
+    for _ in 0..8 {
+        match reply {
+            Reply::Success => return Ok(client::AuthResult::Success),
+            Reply::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                return Ok(client::AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                })
+            }
+            Reply::InfoRequest { prompts, .. } => {
+                let responses = prompts
+                    .iter()
+                    .map(|_| password.to_string())
+                    .collect::<Vec<_>>();
+                reply = handle
+                    .authenticate_keyboard_interactive_respond(responses)
+                    .await
+                    .map_err(|e| {
+                        Error::Auth(format!("SSH keyboard-interactive response failed: {e}"))
+                    })?;
+            }
+        }
+    }
+    Err(Error::Auth(
+        "SSH keyboard-interactive: too many prompt rounds (MFA?). Use a key or agent.".into(),
+    ))
 }
 
 /// Type-erased agent client (the concrete stream differs per platform).

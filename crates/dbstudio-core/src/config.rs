@@ -77,18 +77,33 @@ pub enum TlsMode {
 }
 
 impl TlsMode {
+    /// Every mode, in UI order (form pick-lists).
+    pub const ALL: [TlsMode; 5] = [
+        TlsMode::Disable,
+        TlsMode::Prefer,
+        TlsMode::Require,
+        TlsMode::VerifyCa,
+        TlsMode::VerifyFull,
+    ];
+
     pub fn label(&self) -> &'static str {
         match self {
-            TlsMode::Disable => "Disabled",
-            TlsMode::Prefer => "Prefer",
-            TlsMode::Require => "Require",
-            TlsMode::VerifyCa => "Verify CA",
-            TlsMode::VerifyFull => "Verify full",
+            TlsMode::Disable => "Deshabilitado",
+            TlsMode::Prefer => "Preferir",
+            TlsMode::Require => "Requerir",
+            TlsMode::VerifyCa => "Verificar CA",
+            TlsMode::VerifyFull => "Verificado completo",
         }
     }
 
     pub fn wants_tls(&self) -> bool {
         !matches!(self, TlsMode::Disable)
+    }
+}
+
+impl std::fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 

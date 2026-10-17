@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use dbstudio_core::{
     CellValue, ColumnMeta, ConnectionConfig, DataType, Engine, Error, ExecuteRequest, ObjectKind,
-    ObjectNode, ObjectRef, QueryResult, Result, TypeFamily,
+    ObjectNode, ObjectRef, QueryResult, Result, TypeFamily, TlsMode,
 };
 use dbstudio_ssh::Tunnel;
 use mysql_async::consts::ColumnType;
@@ -31,22 +31,34 @@ pub async fn connect(
         None => (cfg.host.clone(), cfg.port),
     };
 
-    let mut builder = OptsBuilder::default()
-        .ip_or_hostname(host)
-        .tcp_port(port)
-        .user(Some(cfg.username.clone()))
-        .pass(cfg.password.as_ref().map(|p| p.expose().to_string()));
-    if !cfg.database.is_empty() {
-        builder = builder.db_name(Some(cfg.database.clone()));
-    }
-    if cfg.tls.wants_tls() && tunnel.is_none() {
-        builder = builder.ssl_opts(Some(SslOpts::default()));
-    }
+    let want_tls = cfg.tls.wants_tls() && tunnel.is_none();
 
-    let opts: Opts = builder.into();
-    let conn = Conn::new(opts)
-        .await
-        .map_err(|e| Error::Connection(format!("mysql: {e}")))?;
+    let build_opts = |with_tls: bool| -> Opts {
+        let mut builder = OptsBuilder::default()
+            .ip_or_hostname(host.clone())
+            .tcp_port(port)
+            .user(Some(cfg.username.clone()))
+            .pass(cfg.password.as_ref().map(|p| p.expose().to_string()));
+        if !cfg.database.is_empty() {
+            builder = builder.db_name(Some(cfg.database.clone()));
+        }
+        if with_tls {
+            builder = builder.ssl_opts(Some(SslOpts::default()));
+        }
+        builder.into()
+    };
+
+    let conn = match Conn::new(build_opts(want_tls)).await {
+        Ok(conn) => conn,
+        // sslmode=prefer: handshake/cert failure → retry in cleartext.
+        Err(e) if want_tls && cfg.tls == TlsMode::Prefer => {
+            tracing::warn!("mysql: TLS attempt failed ({e}); retrying without TLS (mode=prefer)");
+            Conn::new(build_opts(false))
+                .await
+                .map_err(|e| Error::Connection(format!("mysql: {e}")))?
+        }
+        Err(e) => return Err(Error::Connection(format!("mysql: {e}"))),
+    };
 
     Ok(Arc::new(MysqlClient {
         conn: Mutex::new(conn),

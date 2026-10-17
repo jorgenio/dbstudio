@@ -9,6 +9,7 @@ dbstudio-core = { workspace = true }
 dbstudio-drivers = { workspace = true }
 dbstudio-secrets = { workspace = true }
 dirs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 iced = { workspace = true, features = ["tokio"] }
 iced-code-editor = { workspace = true }

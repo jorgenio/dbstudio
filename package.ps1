@@ -1,4 +1,4 @@
-# Build a distributable Windows zip of DBStudio (F6 packaging).
+# Build a distributable Windows zip of jorgenio dbstudio (F6 packaging).
 # Usage: powershell -ExecutionPolicy Bypass -File package.ps1
 param(
     [string]$Out = "dist"
@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 
 Copy-Item $exe (Join-Path $stage "dbstudio.exe")
 
-$zip = Join-Path $Out "DBStudio-$version-win64.zip"
+$zip = Join-Path $Out "jorgenio-dbstudio-$version-win64.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
 Remove-Item $stage -Recurse -Force

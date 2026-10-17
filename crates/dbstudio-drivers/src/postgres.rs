@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use dbstudio_core::{
     CellValue, ColumnMeta, ConnectionConfig, Engine, Error, ExecuteRequest, ObjectKind, ObjectNode,
-    ObjectRef, QueryResult, Result, TypeFamily, DataType,
+    ObjectRef, QueryResult, Result, TypeFamily, DataType, TlsMode,
 };
 use dbstudio_ssh::Tunnel;
 use tokio_postgres::types::Type;
@@ -45,16 +45,37 @@ pub async fn connect(
     }
     pg.connect_timeout(std::time::Duration::from_secs(15));
 
+    // Strict modes must actually get TLS; prefer keeps the library default
+    // (try SSL, fall back to cleartext if the server declines the request).
+    if matches!(cfg.tls, TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull) {
+        pg.ssl_mode(tokio_postgres::config::SslMode::Require);
+    }
+
     let client = if cfg.tls.wants_tls() {
         let tls = MakeRustlsConnect::new(rustls_config()?);
-        let (client, connection) = pg
-            .connect(tls)
-            .await
-            .map_err(|e| Error::Connection(format!("postgres: {e}")))?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
+        match pg.connect(tls).await {
+            Ok((client, connection)) => {
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+            }
+            // sslmode=prefer semantics: the handshake failed (typically a
+            // self-signed or hostname-mismatched cert on a LAN/dev server),
+            // so retry in cleartext instead of refusing the connection.
+            Err(e) if cfg.tls == TlsMode::Prefer => {
+                tracing::warn!("postgres: TLS handshake failed ({e}); retrying without TLS (mode=prefer)");
+                let (client, connection) = pg
+                    .connect(NoTls)
+                    .await
+                    .map_err(|e| Error::Connection(format!("postgres: {e}")))?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                client
+            }
+            Err(e) => return Err(Error::Connection(format!("postgres: {e}"))),
+        }
     } else {
         let (client, connection) = pg
             .connect(NoTls)

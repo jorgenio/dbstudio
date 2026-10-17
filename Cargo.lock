@@ -1303,6 +1303,7 @@ dependencies = [
  "oriel-core",
  "oriel-iced",
  "rfd",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

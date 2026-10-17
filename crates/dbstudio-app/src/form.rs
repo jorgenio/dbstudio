@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use dbstudio_core::{
-    ConnectionConfig, Engine, HostKeyPolicy, SecretString, SshAuth, SshConfig,
+    ConnectionConfig, Engine, HostKeyPolicy, SecretString, SshAuth, SshConfig, TlsMode,
 };
 use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Element, Length};
@@ -29,8 +29,12 @@ pub enum FormMsg {
     SshKeyPath(String),
     SshPassphrase(String),
     SshPolicy(PolicyChoice),
+    /// TLS mode for non-SQLite engines.
+    Tls(TlsMode),
     Submit,
     Cancel,
+    /// Connect + ping with the current fields without saving anything.
+    Test,
 }
 
 /// How the SSH tunnel authenticates.
@@ -107,6 +111,7 @@ pub struct ConnForm {
     pub ssh_key_path: String,
     pub ssh_passphrase: String,
     pub ssh_policy: PolicyChoice,
+    pub tls: TlsMode,
 }
 
 impl Default for ConnForm {
@@ -129,6 +134,7 @@ impl Default for ConnForm {
             ssh_key_path: String::new(),
             ssh_passphrase: String::new(),
             ssh_policy: PolicyChoice::AcceptNew,
+            tls: TlsMode::default(),
         }
     }
 }
@@ -159,8 +165,66 @@ impl ConnForm {
             FormMsg::SshKeyPath(v) => self.ssh_key_path = v,
             FormMsg::SshPassphrase(v) => self.ssh_passphrase = v,
             FormMsg::SshPolicy(v) => self.ssh_policy = v,
-            FormMsg::Submit | FormMsg::Cancel => {}
+            FormMsg::Tls(v) => self.tls = v,
+            FormMsg::Submit | FormMsg::Cancel | FormMsg::Test => {}
         }
+    }
+
+    /// Pre-fill the form from a saved config (connection editing).
+    pub fn from_cfg(cfg: &ConnectionConfig) -> Self {
+        let mut form = Self {
+            name: cfg.name.clone(),
+            engine: cfg.engine,
+            host: cfg.host.clone(),
+            port: if cfg.engine == Engine::Sqlite {
+                String::new()
+            } else {
+                cfg.port.to_string()
+            },
+            database: cfg.database.clone(),
+            username: cfg.username.clone(),
+            password: cfg
+                .password
+                .as_ref()
+                .map(|p| p.expose().to_string())
+                .unwrap_or_default(),
+            ssh_enabled: cfg.ssh.is_some(),
+            ssh_host: String::new(),
+            ssh_port: "22".to_string(),
+            ssh_user: String::new(),
+            ssh_auth: SshAuthKind::Agent,
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_passphrase: String::new(),
+            ssh_policy: PolicyChoice::Strict,
+            tls: cfg.tls,
+        };
+        if let Some(ssh) = &cfg.ssh {
+            form.ssh_host = ssh.host.clone();
+            form.ssh_port = ssh.port.to_string();
+            form.ssh_user = ssh.username.clone();
+            form.ssh_policy = match ssh.policy {
+                HostKeyPolicy::Strict => PolicyChoice::Strict,
+                HostKeyPolicy::AcceptNew => PolicyChoice::AcceptNew,
+                HostKeyPolicy::Insecure => PolicyChoice::Insecure,
+            };
+            match &ssh.auth {
+                SshAuth::Password { password } => {
+                    form.ssh_auth = SshAuthKind::Password;
+                    form.ssh_password = password.expose().to_string();
+                }
+                SshAuth::PrivateKey { path, passphrase } => {
+                    form.ssh_auth = SshAuthKind::Key;
+                    form.ssh_key_path = path.display().to_string();
+                    form.ssh_passphrase = passphrase
+                        .as_ref()
+                        .map(|p| p.expose().to_string())
+                        .unwrap_or_default();
+                }
+                SshAuth::Agent => form.ssh_auth = SshAuthKind::Agent,
+            }
+        }
+        form
     }
 
     /// Validate the form and produce the driver config.
@@ -199,6 +263,7 @@ impl ConnForm {
         if !self.password.is_empty() {
             cfg = cfg.with_password(self.password.as_str());
         }
+        cfg.tls = self.tls;
 
         if self.ssh_enabled {
             cfg = cfg.with_ssh(self.build_ssh()?);
@@ -254,11 +319,16 @@ impl ConnForm {
     }
 }
 
-pub fn view(form: &ConnForm) -> Element<'_, FormMsg> {
+pub fn view(form: &ConnForm, editing: bool) -> Element<'_, FormMsg> {
     let sqlite = form.engine == Engine::Sqlite;
+    let title = if editing {
+        "Editar conexión"
+    } else {
+        "Nueva conexión"
+    };
 
     let mut fields = column![
-        text("Nueva conexión").size(14),
+        text(title).size(14),
         labeled("Nombre", text_input("nombre", &form.name).on_input(FormMsg::Name)),
         labeled(
             "Motor",
@@ -293,6 +363,10 @@ pub fn view(form: &ConnForm) -> Element<'_, FormMsg> {
             "Contraseña",
             text_input("••••••", &form.password).on_input(FormMsg::Password),
         ));
+        fields = fields.push(labeled(
+            "TLS",
+            pick_list(TlsMode::ALL, Some(form.tls), FormMsg::Tls).width(Length::Fill),
+        ));
         fields = fields.push(
             checkbox(form.ssh_enabled)
                 .label("Conectar vía túnel SSH")
@@ -307,7 +381,9 @@ pub fn view(form: &ConnForm) -> Element<'_, FormMsg> {
         .push(
             row![
                 button(text("Cancelar")).on_press(FormMsg::Cancel),
-                button(text("Conectar")).on_press(FormMsg::Submit),
+                button(text("Probar")).on_press(FormMsg::Test),
+                button(text(if editing { "Guardar" } else { "Conectar" }))
+                    .on_press(FormMsg::Submit),
             ]
             .spacing(8),
         )
@@ -389,4 +465,63 @@ fn labeled<'a>(label: &'a str, control: impl Into<Element<'a, FormMsg>>) -> Elem
         .spacing(2)
         .width(Length::Fill)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_cfg() -> ConnectionConfig {
+        ConnectionConfig::new("pg-prod", Engine::Postgres)
+            .with_host("db.example.com")
+            .with_port(5433)
+            .with_database("appdb")
+            .with_username("admin")
+            .with_password("s3cret")
+    }
+
+    #[test]
+    fn default_form_uses_prefer_tls() {
+        assert_eq!(ConnForm::default().tls, TlsMode::Prefer);
+    }
+
+    #[test]
+    fn from_cfg_build_roundtrip_preserves_fields_and_tls() {
+        let mut cfg = sample_cfg();
+        cfg.tls = TlsMode::Require;
+        let form = ConnForm::from_cfg(&cfg);
+        assert_eq!(form.name, "pg-prod");
+        assert_eq!(form.host, "db.example.com");
+        assert_eq!(form.port, "5433");
+        assert_eq!(form.tls, TlsMode::Require);
+        assert_eq!(form.password, "s3cret");
+
+        let out = form.build().unwrap();
+        assert_eq!(out.tls, TlsMode::Require, "tls mode survives editing");
+        assert_eq!(out.host, "db.example.com");
+        assert_eq!(out.port, 5433);
+        assert_eq!(out.database, "appdb");
+        assert_eq!(out.username, "admin");
+        assert_eq!(out.password.as_ref().map(|p| p.expose()), Some("s3cret"));
+    }
+
+    #[test]
+    fn build_rejects_empty_host_and_bad_port() {
+        let mut form = ConnForm::default();
+        form.engine = Engine::Postgres;
+        form.host.clear();
+        assert!(form.build().is_err());
+
+        form.host = "db.local".into();
+        form.port = "nope".into();
+        let err = form.build().unwrap_err();
+        assert!(err.contains("puerto"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tls_labels_are_spanish_for_the_pick_list() {
+        assert_eq!(TlsMode::Disable.to_string(), "Deshabilitado");
+        assert_eq!(TlsMode::Prefer.to_string(), "Preferir");
+        assert_eq!(TlsMode::ALL.len(), 5);
+    }
 }
