@@ -49,6 +49,35 @@ struct ConnEntry {
     state: ConnState,
 }
 
+/// One query workspace in the tab strip: its own SQL text, result set and
+/// connection binding. The live `App` fields mirror `tabs[active_tab]`
+/// (stash on switch, load on switch back).
+struct Tab {
+    title: String,
+    content: String,
+    connection: Option<ConnectionId>,
+    grid: VirtualGrid<grid::ResultStore>,
+    executed: bool,
+    last_row_count: usize,
+    last_columns: Vec<ColumnMeta>,
+    query_context: Option<String>,
+}
+
+impl Tab {
+    fn new(title: String, connection: Option<ConnectionId>) -> Self {
+        Self {
+            title,
+            content: String::new(),
+            connection,
+            grid: grid::empty(),
+            executed: false,
+            last_row_count: 0,
+            last_columns: Vec::new(),
+            query_context: None,
+        }
+    }
+}
+
 struct App {
     rt: Arc<tokio::runtime::Runtime>,
     store: Connections,
@@ -59,8 +88,14 @@ struct App {
     entries: Vec<ConnEntry>,
     selected: Option<usize>,
     form: Option<ConnForm>,
-    session: Option<Arc<Session>>,
+    /// Live session per connection (multi-DB: tabs may bind different ones).
+    sessions: HashMap<ConnectionId, Arc<Session>>,
     active_id: Option<ConnectionId>,
+    /// Query workspaces; the live fields mirror `tabs[active_tab]`.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    /// Monotonic counter for unique tab titles ("Consulta N").
+    next_tab: usize,
     root: Option<ObjectRef>,
     tree: HashMap<ObjectRef, Vec<ObjectNode>>,
     expanded: HashSet<ObjectRef>,
@@ -104,13 +139,20 @@ enum Message {
     Run,
     OpenForm,
     Form(FormMsg),
-    Connected(Result<ConnectedPayload, String>),
+    /// Ok: id, session, root and children. Err: (id, error) so concurrent
+    /// handshakes can be attributed to the right entry.
+    Connected(Result<ConnectedPayload, (ConnectionId, String)>),
     ChildrenLoaded(ObjectRef, Result<Vec<ObjectNode>, String>),
     TreeToggle(ObjectRef),
     /// Table/view/collection clicked: put a starter query in the editor and
     /// expand the node's children.
     TreeOpenObject(ObjectRef, ObjectKind),
-    Executed(Result<QueryResult, String>),
+    /// Statement finished for the tab that started it (`usize` tab index).
+    Executed(usize, Result<QueryResult, String>),
+    /// Tab strip: open / close / focus.
+    NewTab,
+    CloseTab(usize),
+    SelectTab(usize),
     /// Copy selected rows (all when nothing is selected) as TSV.
     CopyValues,
     /// Copy rows as TSV with a header line of column names.
@@ -287,8 +329,11 @@ fn boot() -> (App, Task<Message>) {
             entries,
             selected: None,
             form: None,
-            session: None,
+            sessions: HashMap::new(),
             active_id: None,
+            tabs: vec![Tab::new("Consulta 1".to_string(), None)],
+            active_tab: 0,
+            next_tab: 2,
             root: None,
             tree: HashMap::new(),
             expanded: HashSet::new(),
@@ -314,7 +359,7 @@ fn connect_task(rt: Arc<tokio::runtime::Runtime>, cfg: ConnectionConfig) -> Task
     let root_reply = root.clone();
     Task::perform(
         async move {
-            let res = rt
+            match rt
                 .spawn(async move {
                     let session = drivers::connect(&cfg).await.map_err(|e| e.to_string())?;
                     let children = session
@@ -325,8 +370,11 @@ fn connect_task(rt: Arc<tokio::runtime::Runtime>, cfg: ConnectionConfig) -> Task
                     Ok::<_, String>((Arc::new(session), children))
                 })
                 .await
-                .map_err(|e| e.to_string())?;
-            res.map(|(session, children)| (id, session, root_reply, children))
+            {
+                Ok(Ok((session, children))) => Ok((id, session, root_reply, children)),
+                Ok(Err(e)) => Err((id, e)),
+                Err(join) => Err((id, join.to_string())),
+            }
         },
         Message::Connected,
     )
@@ -361,6 +409,7 @@ fn execute_task(
     rt: Arc<tokio::runtime::Runtime>,
     client: std::sync::Arc<dyn drivers::DatabaseClient>,
     req: ExecuteRequest,
+    tab: usize,
 ) -> Task<Message> {
     Task::perform(
         async move {
@@ -368,8 +417,26 @@ fn execute_task(
                 .await
                 .map_err(|e| e.to_string())?
         },
-        Message::Executed,
+        move |res| Message::Executed(tab, res),
     )
+}
+
+/// Which tab index becomes active after closing `closed` in a strip of
+/// `len` tabs where `active` was focused.
+fn active_after_close(len: usize, active: usize, closed: usize) -> usize {
+    debug_assert!(len > 1, "single-tab strips are recreated instead");
+    if closed < active {
+        active - 1
+    } else if closed == active {
+        // Focus falls to the neighbour; at the tail, step back.
+        if active == len - 1 {
+            active - 1
+        } else {
+            active
+        }
+    } else {
+        active
+    }
 }
 
 impl App {
@@ -483,10 +550,21 @@ impl App {
             }
             Message::SelectConnection(i) => {
                 self.selected = Some(i);
-                let (name, state) = {
+                let (name, state, id) = {
                     let e = &self.entries[i];
-                    (e.cfg.name.clone(), e.state.clone())
+                    (e.cfg.name.clone(), e.state.clone(), e.cfg.id)
                 };
+                // Rebind the ACTIVE TAB to this connection: the sidebar picks
+                // the database that the current workspace talks to.
+                self.active_id = Some(id);
+                self.root = Some(ObjectRef::root(id));
+                self.query_context = None;
+                self.completion.close();
+                self.completion.dictionary = self
+                    .completion_words
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
                 match state {
                     ConnState::Connected => {
                         self.status = format!("conectada: {name}");
@@ -518,14 +596,22 @@ impl App {
                     return Task::none();
                 }
                 let removed = self.entries.remove(i);
+                self.sessions.remove(&removed.cfg.id);
+                self.completion_words.remove(&removed.cfg.id);
+                for tab in &mut self.tabs {
+                    if tab.connection == Some(removed.cfg.id) {
+                        tab.connection = None;
+                    }
+                }
                 if self.active_id == Some(removed.cfg.id) {
                     // Dropping the session closes its tunnel/client.
-                    self.session = None;
                     self.active_id = None;
                     self.root = None;
-                    self.tree.clear();
-                    self.expanded.clear();
+                    self.tree.retain(|k, _| k.connection != removed.cfg.id);
+                    self.expanded.retain(|k| k.connection != removed.cfg.id);
                     self.query_context = None;
+                    self.completion.dictionary.clear();
+                    self.completion.close();
                 }
                 // No auto-reselect: a second Delete must be preceded by an
                 // explicit click, so one stray keypress can't cascade.
@@ -538,9 +624,13 @@ impl App {
                 Task::none()
             }
             Message::Run => {
-                let Some(session) = &self.session else {
+                let Some(id) = self.active_id else {
                     self.status =
-                        "sin conexión — abre «+ Nueva conexión» primero".to_string();
+                        "sin conexión — selecciona una en la barra lateral".to_string();
+                    return Task::none();
+                };
+                let Some(session) = self.sessions.get(&id) else {
+                    self.status = "la conexión no está activa — selecciónala de nuevo".to_string();
                     return Task::none();
                 };
                 let sql = self.editor.content();
@@ -552,7 +642,7 @@ impl App {
                 self.status = "ejecutando…".to_string();
                 let mut req = ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
                 req.context = self.query_context.clone();
-                execute_task(self.rt.clone(), client, req)
+                execute_task(self.rt.clone(), client, req, self.active_tab)
             }
             Message::OpenForm => {
                 self.form = Some(ConnForm::default());
@@ -620,17 +710,19 @@ impl App {
                 match form.build() {
                     Ok(mut cfg) => {
                         if let Some(i) = self.editing.take() {
-                            // Keep identity and in-place the entry; an old
-                            // live session for it is stale and gets dropped.
+                            // Keep identity and in-place the entry; the old
+                            // session/caches for it are stale and get dropped.
                             let old = &self.entries[i].cfg;
                             cfg.id = old.id;
+                            self.sessions.remove(&cfg.id);
+                            self.completion_words.remove(&cfg.id);
+                            self.tree.retain(|k, _| k.connection != cfg.id);
+                            self.expanded.retain(|k| k.connection != cfg.id);
                             if self.active_id == Some(cfg.id) {
-                                self.session = None;
-                                self.active_id = None;
                                 self.root = None;
-                                self.tree.clear();
-                                self.expanded.clear();
                                 self.query_context = None;
+                                self.completion.dictionary.clear();
+                                self.completion.close();
                             }
                             self.entries[i].cfg = cfg.clone();
                             self.entries[i].state = ConnState::Connecting;
@@ -639,6 +731,10 @@ impl App {
                             self.status = format!("guardada — conectando a {}…", cfg.name);
                             connect_task(self.rt.clone(), cfg)
                         } else {
+                            // New connection: bind it to the active tab so
+                            // Connected adopts it as the live workspace.
+                            self.active_id = Some(cfg.id);
+                            self.root = Some(ObjectRef::root(cfg.id));
                             self.entries.push(ConnEntry {
                                 cfg: cfg.clone(),
                                 state: ConnState::Connecting,
@@ -673,39 +769,39 @@ impl App {
                 if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.id == id) {
                     e.state = ConnState::Connected;
                 }
+                // Per-connection refresh: stale children/expansion from a
+                // previous session are dropped, the fresh root is kept.
+                self.tree.retain(|k, _| k.connection != id);
+                self.expanded.retain(|k| k.connection != id);
                 self.tree.insert(root.clone(), children);
-                self.expanded.clear();
                 self.expanded.insert(root.clone());
-                self.query_context = None;
-                self.completion.close();
-                self.completion.dictionary = self
-                    .completion_words
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
-                self.root = Some(root.clone());
                 let load_session = session.clone();
-                self.session = Some(session);
-                self.active_id = Some(id);
+                self.sessions.insert(id, session);
                 self.status = match self.entries.iter().find(|e| e.cfg.id == id) {
                     Some(e) => format!("conectada: {} ({})", e.cfg.name, e.cfg.engine),
                     None => "conectada".to_string(),
                 };
+                // Adopt into the live workspace only when this connection is
+                // what the active tab binds; otherwise the caches above wait
+                // for the tab to switch back (load_tab adopts from them).
+                if self.active_id == Some(id) {
+                    self.root = Some(root.clone());
+                    self.query_context = None;
+                    self.completion.close();
+                    self.completion.dictionary = self
+                        .completion_words
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default();
+                }
                 Task::perform(
                     load_completion_words(load_session, root),
                     move |words| Message::CompletionWordsLoaded(id, words),
                 )
             }
-            Message::Connected(Err(e)) => {
-                if let Some(entry) = self
-                    .entries
-                    .iter_mut()
-                    .find(|e| matches!(e.state, ConnState::Connecting))
-                {
+            Message::Connected(Err((id, e))) => {
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.cfg.id == id) {
                     entry.state = ConnState::Error(e.clone());
-                }
-                if self.active_id.is_none() {
-                    self.session = None;
                 }
                 self.status = format!("error de conexión: {e}");
                 Task::none()
@@ -757,31 +853,53 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Executed(Ok(result)) => {
-                let ms = result.elapsed.as_millis();
-                self.executed = true;
-                self.status = if result.is_rows() {
-                    format!(
-                        "{} filas{} ({ms} ms)",
-                        result.row_count(),
-                        if result.truncated {
-                            format!(" (truncadas en {MAX_ROWS})")
-                        } else {
-                            String::new()
-                        }
-                    )
-                } else {
-                    format!("{} afectada(s) ({ms} ms)", result.affected.unwrap_or(0))
-                };
-                self.last_columns = result.columns.clone();
-                self.last_row_count = result.row_count();
-                let (grid, init) = grid::build(result);
-                self.grid = grid;
-                init.map(Message::Grid)
+            Message::Executed(tab, res) => match res {
+                Ok(result) => self.apply_result(tab, result),
+                Err(e) => {
+                    // Errors only surface on the tab that ran them.
+                    if tab == self.active_tab {
+                        self.status = format!("error: {e}");
+                    }
+                    Task::none()
+                }
+            },
+            Message::NewTab => {
+                self.stash_tab();
+                let title = format!("Consulta {}", self.next_tab);
+                self.next_tab += 1;
+                let connection = self.active_id;
+                self.tabs.push(Tab::new(title, connection));
+                self.active_tab = self.tabs.len() - 1;
+                self.load_tab(self.active_tab)
             }
-            Message::Executed(Err(e)) => {
-                self.status = format!("error: {e}");
-                Task::none()
+            Message::CloseTab(index) => {
+                if index >= self.tabs.len() {
+                    return Task::none();
+                }
+                self.stash_tab();
+                if self.tabs.len() == 1 {
+                    // Last tab closed → start a fresh, unbound one.
+                    self.tabs.remove(0);
+                    self.tabs
+                        .push(Tab::new(format!("Consulta {}", self.next_tab), None));
+                    self.next_tab += 1;
+                    self.active_tab = 0;
+                } else {
+                    // Compute the successor before mutating the strip.
+                    let new_active =
+                        active_after_close(self.tabs.len(), self.active_tab, index);
+                    self.tabs.remove(index);
+                    self.active_tab = new_active;
+                }
+                self.load_tab(self.active_tab)
+            }
+            Message::SelectTab(index) => {
+                if index >= self.tabs.len() || index == self.active_tab {
+                    return Task::none();
+                }
+                self.stash_tab();
+                self.active_tab = index;
+                self.load_tab(index)
             }
             Message::CopyValues => self.copy_rows(false),
             Message::CopyWithHeaders => self.copy_rows(true),
@@ -962,6 +1080,92 @@ impl App {
         iced::clipboard::write(lines.join("\r\n"))
     }
 
+    /// Save the live editor/result/connection fields into `tabs[active_tab]`
+    /// (the grid is moved out and replaced with an empty one).
+    fn stash_tab(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.content = self.editor.content().into();
+        tab.grid = std::mem::replace(&mut self.grid, grid::empty());
+        tab.connection = self.active_id;
+        tab.executed = self.executed;
+        tab.last_row_count = self.last_row_count;
+        tab.last_columns = std::mem::take(&mut self.last_columns);
+        tab.query_context = self.query_context.clone();
+    }
+
+    /// Restore `tabs[index]` into the live fields and refill its grid.
+    fn load_tab(&mut self, index: usize) -> Task<Message> {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return Task::none();
+        };
+        self.active_id = tab.connection;
+        self.root = tab.connection.map(ObjectRef::root);
+        self.selected = self
+            .active_id
+            .and_then(|id| self.entries.iter().position(|e| e.cfg.id == id));
+        self.executed = tab.executed;
+        self.last_row_count = tab.last_row_count;
+        self.last_columns = std::mem::take(&mut tab.last_columns);
+        self.query_context = tab.query_context.clone();
+        let content = tab.content.clone();
+        self.grid = std::mem::replace(&mut tab.grid, grid::empty());
+        // Refill the restored grid with its last query (set_spec resets the
+        // window and returns the initial fetch; `fetch_task` is private).
+        let spec = self.grid.spec().clone();
+        let refill = self.grid.set_spec(spec).map(Message::Grid);
+        self.completion.close();
+        self.completion.dictionary = self
+            .active_id
+            .and_then(|id| self.completion_words.get(&id))
+            .cloned()
+            .unwrap_or_default();
+        let edit = self.editor.reset(&content).map(Message::Editor);
+        Task::batch([edit, refill])
+    }
+
+    /// Result of a finished statement: goes live when it belongs to the
+    /// active tab, otherwise it is parked in its tab (refilled on switch).
+    fn apply_result(&mut self, tab_index: usize, result: QueryResult) -> Task<Message> {
+        let ms = result.elapsed.as_millis();
+        let status = if result.is_rows() {
+            format!(
+                "{} filas{} ({ms} ms)",
+                result.row_count(),
+                if result.truncated {
+                    format!(" (truncadas en {MAX_ROWS})")
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            format!("{} afectada(s) ({ms} ms)", result.affected.unwrap_or(0))
+        };
+        let executed = result.is_rows();
+        let columns = result.columns.clone();
+        let row_count = result.row_count();
+        if tab_index == self.active_tab {
+            self.executed = true;
+            self.status = status;
+            self.last_columns = columns;
+            self.last_row_count = row_count;
+            let (grid, init) = grid::build(result);
+            self.grid = grid;
+            init.map(Message::Grid)
+        } else if let Some(tab) = self.tabs.get_mut(tab_index) {
+            let (grid, _init) = grid::build(result);
+            tab.grid = grid;
+            tab.executed = executed;
+            tab.last_columns = columns;
+            tab.last_row_count = row_count;
+            Task::none()
+        } else {
+            // Tab was closed while the statement ran: drop the result.
+            Task::none()
+        }
+    }
+
     /// Toggle (or lazily load) the children of a navigator node.
     fn expand(&mut self, node: &ObjectRef) -> Task<Message> {
         if self.expanded.contains(node) {
@@ -972,7 +1176,9 @@ impl App {
         if self.tree.contains_key(node) {
             return Task::none();
         }
-        let Some(session) = &self.session else {
+        // Every node carries its connection (`child()` propagates it), so
+        // multi-DB tabs can each expand their own tree via the shared map.
+        let Some(session) = self.sessions.get(&node.connection).cloned() else {
             return Task::none();
         };
         let client = session.client.clone();
@@ -1147,13 +1353,36 @@ impl App {
             .style(theme::navigator);
 
         // ── editor pane with its tab strip ──────────────────────────────
-        let editor_tabs = container(
-            row![button(text("  Consulta 1  ").size(13)).style(theme::tab_active)]
+        let mut tab_row = row![].spacing(4).align_y(iced::Alignment::Center);
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let style: fn(&Theme, button::Status) -> button::Style =
+                if i == self.active_tab {
+                    theme::tab_active
+                } else {
+                    theme::tab_inactive
+                };
+            tab_row = tab_row.push(
+                row![
+                    button(text(format!(" {} ", tab.title)).size(13))
+                        .style(style)
+                        .on_press(Message::SelectTab(i)),
+                    button(text("✕").size(10))
+                        .style(theme::flat)
+                        .on_press(Message::CloseTab(i)),
+                ]
+                .spacing(2)
                 .align_y(iced::Alignment::Center),
-        )
-        .width(Length::Fill)
-        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
-        .style(theme::chrome);
+            );
+        }
+        tab_row = tab_row.push(
+            button(text(" + ").size(14))
+                .style(theme::flat)
+                .on_press(Message::NewTab),
+        );
+        let editor_tabs = container(tab_row)
+            .width(Length::Fill)
+            .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+            .style(theme::chrome);
         // The completion popup floats over the editor (bottom-left); when
         // closed the overlay is an inert empty space.
         let editor_layers: Vec<Element<Message>> = vec![
@@ -1784,6 +2013,34 @@ async fn load_completion_words(session: Arc<Session>, root: ObjectRef) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_tab_successor_math() {
+        // Close before the active one → active shifts left.
+        assert_eq!(active_after_close(3, 2, 0), 1);
+        // Close after the active one → active stays.
+        assert_eq!(active_after_close(3, 0, 2), 0);
+        // Close a middle active tab → the next one slides into its slot.
+        assert_eq!(active_after_close(3, 1, 1), 1);
+        // Close the LAST active tab → focus steps back.
+        assert_eq!(active_after_close(3, 2, 2), 1);
+        // Two tabs: close the active first one → second becomes active(0).
+        assert_eq!(active_after_close(2, 0, 0), 0);
+        // Two tabs: close the active last one → first becomes active(0).
+        assert_eq!(active_after_close(2, 1, 1), 0);
+    }
+
+    #[test]
+    fn tab_new_starts_fresh_and_unbound() {
+        let tab = Tab::new("Consulta 7".to_string(), None);
+        assert_eq!(tab.title, "Consulta 7");
+        assert_eq!(tab.content, "");
+        assert_eq!(tab.connection, None);
+        assert!(!tab.executed);
+        assert_eq!(tab.last_row_count, 0);
+        assert!(tab.last_columns.is_empty());
+        assert_eq!(tab.query_context, None);
+    }
 
     #[test]
     fn completion_filters_case_insensitively() {
