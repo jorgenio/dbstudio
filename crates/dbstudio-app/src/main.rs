@@ -3,6 +3,7 @@
 //! editor runs statements through `dbstudio-drivers` and the result grid is
 //! rebuilt from the driver's normalized `QueryResult`.
 
+mod er;
 mod export;
 mod form;
 mod grid;
@@ -78,6 +79,16 @@ impl Tab {
     }
 }
 
+/// Workspace-level ER diagram overlay (global: not one per query tab).
+struct ErState {
+    connection: ConnectionId,
+    /// Ready diagram once the batch finished; `None` while loading or empty.
+    diagram: Option<er::Diagram>,
+    loading: bool,
+    /// Per-table failures / notes (e.g. truncated batch).
+    failed: Vec<String>,
+}
+
 struct App {
     rt: Arc<tokio::runtime::Runtime>,
     store: Connections,
@@ -96,6 +107,8 @@ struct App {
     active_tab: usize,
     /// Monotonic counter for unique tab titles ("Consulta N").
     next_tab: usize,
+    /// Open ER diagram overlay, when the workspace shows it.
+    er: Option<ErState>,
     root: Option<ObjectRef>,
     tree: HashMap<ObjectRef, Vec<ObjectNode>>,
     expanded: HashSet<ObjectRef>,
@@ -153,6 +166,10 @@ enum Message {
     NewTab,
     CloseTab(usize),
     SelectTab(usize),
+    /// ER diagram: load (or reload), close, and the table batch.
+    ErOpen,
+    ErClose,
+    ErLoaded(Result<er::ErPayload, String>),
     /// Copy selected rows (all when nothing is selected) as TSV.
     CopyValues,
     /// Copy rows as TSV with a header line of column names.
@@ -334,6 +351,7 @@ fn boot() -> (App, Task<Message>) {
             tabs: vec![Tab::new("Consulta 1".to_string(), None)],
             active_tab: 0,
             next_tab: 2,
+            er: None,
             root: None,
             tree: HashMap::new(),
             expanded: HashSet::new(),
@@ -437,6 +455,31 @@ fn active_after_close(len: usize, active: usize, closed: usize) -> usize {
     } else {
         active
     }
+}
+
+/// Discover the connection's tables and describe them all in one hop.
+fn er_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    root: ObjectRef,
+    connection: ConnectionId,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let res: Result<_, String> = rt
+                .spawn(async move {
+                    er::load(&*client, &root).await.map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            res.map(|(tables, failed)| er::ErPayload {
+                connection,
+                tables,
+                failed,
+            })
+        },
+        Message::ErLoaded,
+    )
 }
 
 impl App {
@@ -598,6 +641,9 @@ impl App {
                 let removed = self.entries.remove(i);
                 self.sessions.remove(&removed.cfg.id);
                 self.completion_words.remove(&removed.cfg.id);
+                if self.er.as_ref().is_some_and(|e| e.connection == removed.cfg.id) {
+                    self.er = None;
+                }
                 for tab in &mut self.tabs {
                     if tab.connection == Some(removed.cfg.id) {
                         tab.connection = None;
@@ -900,6 +946,73 @@ impl App {
                 self.stash_tab();
                 self.active_tab = index;
                 self.load_tab(index)
+            }
+            Message::ErOpen => {
+                let Some(id) = self.active_id else {
+                    self.status = "selecciona una conexión para el diagrama ER".to_string();
+                    return Task::none();
+                };
+                let Some(session) = self.sessions.get(&id).cloned() else {
+                    self.status = "la conexión no está activa — selecciónala de nuevo".to_string();
+                    return Task::none();
+                };
+                self.completion.close();
+                self.er = Some(ErState {
+                    connection: id,
+                    diagram: None,
+                    loading: true,
+                    failed: Vec::new(),
+                });
+                self.status = "cargando diagrama ER…".to_string();
+                er_task(self.rt.clone(), session.client.clone(), ObjectRef::root(id), id)
+            }
+            Message::ErLoaded(Ok(payload)) => {
+                // Build the status first so the `ErState` borrow can end.
+                let status = match self.er.as_mut() {
+                    Some(er) if er.connection == payload.connection => {
+                        er.loading = false;
+                        er.failed = payload.failed;
+                        let diagram = if payload.tables.is_empty() {
+                            None
+                        } else {
+                            Some(er::Diagram::new(payload.tables))
+                        };
+                        let (tables, rels) =
+                            diagram.as_ref().map_or((0, 0), |d| (d.tables.len(), d.edges.len()));
+                        er.diagram = diagram;
+                        if tables == 0 {
+                            if er.failed.is_empty() {
+                                "diagrama ER: sin tablas en esta conexión".to_string()
+                            } else {
+                                format!("diagrama ER: {}", er.failed.join(" · "))
+                            }
+                        } else {
+                            let note = if er.failed.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({} avisos)", er.failed.len())
+                            };
+                            format!("diagrama ER: {tables} tablas, {rels} relaciones{note}")
+                        }
+                    }
+                    // Stale batch (diagrama cerrado o de otra conexión).
+                    _ => String::new(),
+                };
+                if !status.is_empty() {
+                    self.status = status;
+                }
+                Task::none()
+            }
+            Message::ErLoaded(Err(e)) => {
+                if let Some(er) = self.er.as_mut() {
+                    er.loading = false;
+                }
+                self.status = format!("error al cargar el diagrama: {e}");
+                Task::none()
+            }
+            Message::ErClose => {
+                self.er = None;
+                Task::none()
             }
             Message::CopyValues => self.copy_rows(false),
             Message::CopyWithHeaders => self.copy_rows(true),
@@ -1208,6 +1321,80 @@ impl App {
         query_for_engine(engine, obj, kind)
     }
 
+    /// Centered muted message filling the ER body area.
+    fn er_placeholder(msg: String) -> Element<'static, Message> {
+        container(text(msg).size(14).color(theme::muted()))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
+            .into()
+    }
+
+    /// Workspace shown while the ER diagram is open: a header strip with
+    /// reload/close actions over the scrollable diagram canvas (or a
+    /// loading/empty placeholder).
+    fn er_view<'a>(&'a self, er: &'a ErState) -> Element<'a, Message> {
+        let conn_name = self
+            .entries
+            .iter()
+            .find(|e| e.cfg.id == er.connection)
+            .map(|e| e.cfg.name.clone())
+            .unwrap_or_else(|| "conexión".to_string());
+        let strip = container(
+            row![
+                text("Diagrama ER").size(13),
+                text(conn_name).size(12).color(theme::muted()),
+                container(
+                    row![
+                        button(text("↻ Recargar").size(12))
+                            .on_press(Message::ErOpen)
+                            .style(theme::flat),
+                        button(text("✕ Volver").size(12))
+                            .on_press(Message::ErClose)
+                            .style(theme::flat),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+        .style(theme::chrome);
+
+        let body: Element<'_, Message> = if er.loading {
+            Self::er_placeholder("Cargando tablas…".to_string())
+        } else if let Some(diagram) = &er.diagram {
+            let (w, h) = diagram.size;
+            scrollable(
+                container(
+                    iced::widget::canvas(diagram)
+                        .width(Length::Fixed(w + 20.0))
+                        .height(Length::Fixed(h + 20.0)),
+                )
+                .padding(10),
+            )
+            .height(Length::Fill)
+            .into()
+        } else if er.failed.is_empty() {
+            Self::er_placeholder("Sin tablas que mostrar en esta conexión".to_string())
+        } else {
+            Self::er_placeholder(format!("Sin tablas — {}", er.failed.join(" · ")))
+        };
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(body)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         // ── custom title bar: brand + actions + window controls ─────────
         // Frameless window: the bar replaces the native title bar, so it is
@@ -1245,6 +1432,9 @@ impl App {
                 .style(theme::solid),
             button(text(if self.dark { "☾ claro" } else { "☀ oscuro" }).size(13))
                 .on_press(Message::ToggleTheme)
+                .style(theme::flat),
+            button(text("⇄ ER").size(13))
+                .on_press_maybe(self.active_id.is_some().then_some(Message::ErOpen))
                 .style(theme::flat),
             rule::vertical(1).style(theme::hairline),
             container(auto_complete(
@@ -1442,16 +1632,20 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        let main = row![
-            navigator,
-                Column::new()
+        // The ER overlay replaces the editor + results while it is open.
+        let center: Element<'_, Message> = match &self.er {
+            Some(er) => self.er_view(er),
+            None => Column::new()
                 .push(editor_tabs)
                 .push(editor.height(Length::FillPortion(2)))
                 .push(rule::horizontal(1).style(theme::hairline))
                 .push(result_strip)
                 .push(grid.height(Length::FillPortion(3)))
                 .width(Length::Fill)
-        ];
+                .into(),
+        };
+
+        let main = row![navigator, center];
 
         // ── status bar: message left, live connection right ─────────────
         let (conn_label, conn_color) = self

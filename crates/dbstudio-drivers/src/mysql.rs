@@ -15,8 +15,8 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder, Row, SslOpts, Value};
 use tokio::sync::Mutex;
 
-use crate::helpers::{backtick_ident, data_type_from_name};
-use crate::{Capabilities, DatabaseClient, TableDetail};
+use crate::helpers::{backtick_ident, data_type_from_name, sql_literal};
+use crate::{Capabilities, DatabaseClient, ForeignKeyMeta, TableDetail};
 
 pub struct MysqlClient {
     conn: Mutex<Conn>,
@@ -161,19 +161,92 @@ impl DatabaseClient for MysqlClient {
         );
         let rows: Vec<mysql_async::Row> =
             conn.query(sql).await.map_err(|e| Error::Query(e.to_string()))?;
+        let mut columns = Vec::new();
+        let mut primary_keys = Vec::new();
+        for r in rows {
+            let col_name: String = r.get::<String, usize>(0).unwrap_or_default();
+            if r.get::<String, usize>(3)
+                .is_some_and(|k| k.eq_ignore_ascii_case("PRI"))
+            {
+                primary_keys.push(col_name.clone());
+            }
+            columns.push(ColumnMeta {
+                name: col_name,
+                data_type: data_type_from_name(r.get::<String, usize>(1).unwrap_or_default()),
+                nullable: r
+                    .get::<String, usize>(2)
+                    .map(|s| s.eq_ignore_ascii_case("YES"))
+                    .unwrap_or(true),
+                comment: r.get::<String, usize>(8),
+            });
+        }
+
+        // Key columns: the PRIMARY KEY rows (no referenced table) and every
+        // foreign key column (referenced table set) come from one query.
+        let (qs, qn) = (sql_literal(db), sql_literal(name));
+        let fk_sql = format!(
+            "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
+                    REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = {qs} AND TABLE_NAME = {qn} \
+               AND (CONSTRAINT_NAME = 'PRIMARY' OR REFERENCED_TABLE_NAME IS NOT NULL) \
+             ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"
+        );
+        let fk_rows: Vec<mysql_async::Row> =
+            conn.query(fk_sql).await.map_err(|e| Error::Query(e.to_string()))?;
+        let mut foreign_keys: Vec<ForeignKeyMeta> = Vec::new();
+        for r in fk_rows {
+            let Some(constraint) = r.get::<String, usize>(0) else { continue };
+            if constraint.eq_ignore_ascii_case("PRIMARY") {
+                continue;
+            }
+            let column: String = r.get::<String, usize>(1).unwrap_or_default();
+            let ref_table: String = r.get::<String, usize>(2).unwrap_or_default();
+            let ref_column: String = r.get::<String, usize>(3).unwrap_or_default();
+            match foreign_keys
+                .iter_mut()
+                .find(|fk| fk.name.as_deref() == Some(constraint.as_str()))
+            {
+                Some(fk) => {
+                    fk.columns.push(column);
+                    fk.ref_columns.push(ref_column);
+                }
+                None => foreign_keys.push(ForeignKeyMeta {
+                    name: Some(constraint),
+                    columns: vec![column],
+                    ref_table,
+                    ref_columns: vec![ref_column],
+                    on_delete: None,
+                    on_update: None,
+                }),
+            }
+        }
+        if !foreign_keys.is_empty() {
+            let rules_sql = format!(
+                "SELECT CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE \
+                 FROM information_schema.REFERENTIAL_CONSTRAINTS \
+                 WHERE TABLE_SCHEMA = {qs} AND TABLE_NAME = {qn}"
+            );
+            let rules: Vec<mysql_async::Row> =
+                conn.query(rules_sql).await.map_err(|e| Error::Query(e.to_string()))?;
+            for r in rules {
+                let Some(constraint) = r.get::<String, usize>(0) else { continue };
+                let delete: String = r.get::<String, usize>(1).unwrap_or_default();
+                let update: String = r.get::<String, usize>(2).unwrap_or_default();
+                if let Some(fk) = foreign_keys
+                    .iter_mut()
+                    .find(|fk| fk.name.as_deref() == Some(constraint.as_str()))
+                {
+                    fk.on_delete = Some(delete);
+                    fk.on_update = Some(update);
+                }
+            }
+        }
+
         Ok(TableDetail {
-            columns: rows
-                .into_iter()
-                .map(|r| ColumnMeta {
-                    name: r.get::<String, usize>(0).unwrap_or_default(),
-                    data_type: data_type_from_name(r.get::<String, usize>(1).unwrap_or_default()),
-                    nullable: r
-                        .get::<String, usize>(2)
-                        .map(|s| s.eq_ignore_ascii_case("YES"))
-                        .unwrap_or(true),
-                    comment: r.get::<String, usize>(8),
-                })
-                .collect(),
+            columns,
+            primary_keys,
+            foreign_keys,
         })
     }
 

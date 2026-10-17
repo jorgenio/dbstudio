@@ -40,9 +40,32 @@ impl Capabilities {
     };
 }
 
+/// Columns + constraints of a table: everything the ER diagram and the
+/// table inspector need.
 #[derive(Debug, Clone, Default)]
 pub struct TableDetail {
     pub columns: Vec<ColumnMeta>,
+    /// Ordered names of the primary key columns (empty when there is none).
+    pub primary_keys: Vec<String>,
+    /// Outgoing foreign keys of the table.
+    pub foreign_keys: Vec<ForeignKeyMeta>,
+}
+
+/// One foreign key constraint: local columns → referenced table columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyMeta {
+    /// Constraint name when the engine exposes it.
+    pub name: Option<String>,
+    /// Local columns, in ordinal order (1:1 with `ref_columns`).
+    pub columns: Vec<String>,
+    /// Referenced table, as the engine reports it (may be schema-qualified).
+    pub ref_table: String,
+    /// Referenced columns, aligned with `columns`.
+    pub ref_columns: Vec<String>,
+    /// ON DELETE rule, e.g. `CASCADE` (engine-specific wording kept as-is).
+    pub on_delete: Option<String>,
+    /// ON UPDATE rule.
+    pub on_update: Option<String>,
 }
 
 #[async_trait]

@@ -31,7 +31,7 @@ pub fn app_theme(dark: bool) -> Theme {
 }
 
 /// True when the given theme carries the dark palette.
-fn is_dark(theme: &Theme) -> bool {
+pub(crate) fn is_dark(theme: &Theme) -> bool {
     let bg = theme.palette().background;
     (bg.r + bg.g + bg.b) / 3.0 < 0.5
 }
@@ -295,6 +295,48 @@ pub fn muted() -> Color {
 
 fn muted_on(dark: bool) -> Color {
     if dark { color!(0x7d8592) } else { color!(0x8b919c) }
+}
+
+// --- ER diagram -----------------------------------------------------------
+
+/// Colors used by the entity-relationship canvas (see `er.rs`).
+pub struct ErPalette {
+    /// Background dot grid.
+    pub dot: Color,
+    /// Node outline.
+    pub border: Color,
+    /// Node body.
+    pub node_bg: Color,
+    /// Node header band.
+    pub header: Color,
+    /// Table name over the header band.
+    pub header_text: Color,
+    /// Column names.
+    pub ink: Color,
+    /// Secondary text (types, footnotes, edge labels).
+    pub muted: Color,
+    /// Foreign-key curves.
+    pub edge: Color,
+    /// PK marker.
+    pub marker_pk: Color,
+    /// FK marker.
+    pub marker_fk: Color,
+}
+
+pub fn er_palette(dark: bool) -> ErPalette {
+    let primary = if dark { color!(0x5b8def) } else { color!(0x2f6fed) };
+    ErPalette {
+        dot: if dark { color!(0x2a303a) } else { color!(0xe4e8ee) },
+        border: line(dark),
+        node_bg: if dark { color!(0x20252d) } else { color!(0xffffff) },
+        header: primary,
+        header_text: color!(0xffffff),
+        ink: ink(dark),
+        muted: muted_on(dark),
+        edge: primary,
+        marker_pk: if dark { color!(0xe6a23c) } else { color!(0xd97706) },
+        marker_fk: primary,
+    }
 }
 
 // --- completion popup -----------------------------------------------------

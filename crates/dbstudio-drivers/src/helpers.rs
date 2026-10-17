@@ -36,3 +36,8 @@ pub fn data_type_from_name(name: impl Into<String>) -> DataType {
 pub fn backtick_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
+
+/// Single-quoted SQL string literal (`'` doubled), for hand-built queries.
+pub fn sql_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}

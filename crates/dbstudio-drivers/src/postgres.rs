@@ -19,7 +19,7 @@ use tokio_postgres::{Client, Config, NoTls, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::helpers::data_type_from_name;
-use crate::{Capabilities, DatabaseClient, TableDetail};
+use crate::{Capabilities, DatabaseClient, ForeignKeyMeta, TableDetail};
 
 pub struct PostgresClient {
     client: Client,
@@ -235,16 +235,95 @@ impl DatabaseClient for PostgresClient {
             )
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
+        let columns: Vec<ColumnMeta> = rows
+            .iter()
+            .map(|r| ColumnMeta {
+                name: r.get::<_, String>(0),
+                data_type: data_type_from_name(r.get::<_, String>(1)),
+                nullable: r.get::<_, String>(2).eq_ignore_ascii_case("YES"),
+                comment: None,
+            })
+            .collect();
+
+        // Primary key columns, in key order.
+        let pk_rows = self
+            .client
+            .query(
+                "SELECT kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON kcu.constraint_name = tc.constraint_name \
+                  AND kcu.table_schema = tc.table_schema \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' \
+                   AND tc.table_schema = $1 AND tc.table_name = $2 \
+                 ORDER BY kcu.ordinal_position",
+                &[schema, name],
+            )
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let primary_keys: Vec<String> = pk_rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+
+        // Foreign keys. `position_in_unique_constraint` pairs each local
+        // column with its referenced column (information_schema's
+        // `constraint_column_usage` join is a cross product for composites).
+        let fk_rows = self
+            .client
+            .query(
+                "SELECT tc.constraint_name, kcu.column_name, kcu.ordinal_position, \
+                        kcu2.table_schema, kcu2.table_name, kcu2.column_name, \
+                        rc.delete_rule, rc.update_rule \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON kcu.constraint_name = tc.constraint_name \
+                  AND kcu.table_schema = tc.table_schema \
+                 JOIN information_schema.key_column_usage kcu2 \
+                   ON kcu2.constraint_name = kcu.unique_constraint_name \
+                  AND kcu2.constraint_schema = kcu.unique_constraint_schema \
+                  AND kcu2.ordinal_position = kcu.position_in_unique_constraint \
+                 JOIN information_schema.referential_constraints rc \
+                   ON rc.constraint_name = tc.constraint_name \
+                  AND rc.constraint_schema = tc.table_schema \
+                 WHERE tc.constraint_type = 'FOREIGN KEY' \
+                   AND tc.table_schema = $1 AND tc.table_name = $2 \
+                 ORDER BY tc.constraint_name, kcu.ordinal_position",
+                &[schema, name],
+            )
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut foreign_keys: Vec<ForeignKeyMeta> = Vec::new();
+        for r in &fk_rows {
+            let constraint: String = r.get(0);
+            let column: String = r.get(1);
+            let ref_table: String = r.get(4);
+            let ref_column: String = r.get(5);
+            let on_delete: String = r.get(6);
+            let on_update: String = r.get(7);
+            match foreign_keys
+                .iter_mut()
+                .find(|fk| fk.name.as_deref() == Some(constraint.as_str()))
+            {
+                Some(fk) => {
+                    fk.columns.push(column);
+                    fk.ref_columns.push(ref_column);
+                }
+                None => foreign_keys.push(ForeignKeyMeta {
+                    name: Some(constraint),
+                    columns: vec![column],
+                    ref_table,
+                    ref_columns: vec![ref_column],
+                    on_delete: Some(on_delete),
+                    on_update: Some(on_update),
+                }),
+            }
+        }
+
         Ok(TableDetail {
-            columns: rows
-                .iter()
-                .map(|r| ColumnMeta {
-                    name: r.get::<_, String>(0),
-                    data_type: data_type_from_name(r.get::<_, String>(1)),
-                    nullable: r.get::<_, String>(2).eq_ignore_ascii_case("YES"),
-                    comment: None,
-                })
-                .collect(),
+            columns,
+            primary_keys,
+            foreign_keys,
         })
     }
 

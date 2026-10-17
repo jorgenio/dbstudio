@@ -19,8 +19,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-use crate::helpers::data_type_from_name;
-use crate::{Capabilities, DatabaseClient, TableDetail};
+use crate::helpers::{data_type_from_name, sql_literal};
+use crate::{Capabilities, DatabaseClient, ForeignKeyMeta, TableDetail};
 
 type TiberiusClient = tiberius::Client<tokio_util::compat::Compat<TcpStream>>;
 
@@ -188,25 +188,121 @@ impl DatabaseClient for MssqlClient {
             .into_first_result()
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(TableDetail {
-            columns: rows
-                .iter()
-                .filter_map(|r| {
-                    Some(ColumnMeta {
-                        name: r.try_get::<&str, usize>(0).ok().flatten()?.to_string(),
-                        data_type: data_type_from_name(
-                            r.try_get::<&str, usize>(1).ok().flatten()?,
-                        ),
-                        nullable: r
-                            .try_get::<&str, usize>(2)
-                            .ok()
-                            .flatten()
-                            .map(|s| s.eq_ignore_ascii_case("YES"))
-                            .unwrap_or(true),
-                        comment: None,
-                    })
+        let columns: Vec<ColumnMeta> = rows
+            .iter()
+            .filter_map(|r| {
+                Some(ColumnMeta {
+                    name: r.try_get::<&str, usize>(0).ok().flatten()?.to_string(),
+                    data_type: data_type_from_name(
+                        r.try_get::<&str, usize>(1).ok().flatten()?,
+                    ),
+                    nullable: r
+                        .try_get::<&str, usize>(2)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.eq_ignore_ascii_case("YES"))
+                        .unwrap_or(true),
+                    comment: None,
                 })
-                .collect(),
+            })
+            .collect();
+
+        // Primary key columns in key order.
+        let nq = sql_literal(name);
+        let pk_sql = format!(
+            "SELECT c.name FROM {db}.sys.indexes i \
+             JOIN {db}.sys.index_columns ic \
+               ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             JOIN {db}.sys.columns c \
+               ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN {db}.sys.tables t ON t.object_id = i.object_id AND t.name = {nq} \
+             WHERE i.is_primary_key = 1 \
+             ORDER BY ic.key_ordinal"
+        );
+        let pk_rows = client
+            .query(pk_sql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?
+            .into_first_result()
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let primary_keys: Vec<String> = pk_rows
+            .iter()
+            .filter_map(|r| r.try_get::<&str, usize>(0).ok().flatten().map(String::from))
+            .collect();
+
+        // Foreign keys: one row per column, ordered by constraint + column.
+        let fk_sql = format!(
+            "SELECT fk.name, cp.name, rp.name, rt.name, \
+                    fk.delete_referential_action_desc, \
+                    fk.update_referential_action_desc \
+             FROM {db}.sys.foreign_keys fk \
+             JOIN {db}.sys.foreign_key_columns fkc \
+               ON fkc.constraint_object_id = fk.object_id \
+             JOIN {db}.sys.tables t \
+               ON t.object_id = fk.parent_object_id AND t.name = {nq} \
+             JOIN {db}.sys.columns cp \
+               ON cp.object_id = fkc.parent_object_id \
+              AND cp.column_id = fkc.parent_column_id \
+             JOIN {db}.sys.columns rp \
+               ON rp.object_id = fkc.referenced_object_id \
+              AND rp.column_id = fkc.referenced_column_id \
+             JOIN {db}.sys.tables rt ON rt.object_id = fk.referenced_object_id \
+             ORDER BY fk.name, fkc.constraint_column_id"
+        );
+        let fk_rows = client
+            .query(fk_sql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?
+            .into_first_result()
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut foreign_keys: Vec<ForeignKeyMeta> = Vec::new();
+        for r in &fk_rows {
+            let Some(constraint) = r.try_get::<&str, usize>(0).ok().flatten() else {
+                continue;
+            };
+            let from: String =
+                r.try_get::<&str, usize>(1).ok().flatten().unwrap_or_default().into();
+            let ref_col: String =
+                r.try_get::<&str, usize>(2).ok().flatten().unwrap_or_default().into();
+            let ref_table: String =
+                r.try_get::<&str, usize>(3).ok().flatten().unwrap_or_default().into();
+            let delete: String = r
+                .try_get::<&str, usize>(4)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .replace('_', " ");
+            let update: String = r
+                .try_get::<&str, usize>(5)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .replace('_', " ");
+            match foreign_keys
+                .iter_mut()
+                .find(|fk| fk.name.as_deref() == Some(constraint))
+            {
+                Some(fk) => {
+                    fk.columns.push(from);
+                    fk.ref_columns.push(ref_col);
+                }
+                None => foreign_keys.push(ForeignKeyMeta {
+                    name: Some(constraint.into()),
+                    columns: vec![from],
+                    ref_table,
+                    ref_columns: vec![ref_col],
+                    on_delete: Some(delete),
+                    on_update: Some(update),
+                }),
+            }
+        }
+
+        Ok(TableDetail {
+            columns,
+            primary_keys,
+            foreign_keys,
         })
     }
 

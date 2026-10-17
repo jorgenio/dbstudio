@@ -13,7 +13,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 
 use crate::helpers::data_type_from_name;
-use crate::{Capabilities, DatabaseClient, TableDetail};
+use crate::{Capabilities, DatabaseClient, ForeignKeyMeta, TableDetail};
 
 pub struct SqliteClient {
     conn: Mutex<Connection>,
@@ -133,19 +133,75 @@ impl DatabaseClient for SqliteClient {
             .map_err(|e| Error::Query(e.to_string()))?;
         let rows = stmt
             .query_map([], |r| {
-                Ok(ColumnMeta {
-                    name: r.get(1)?,
-                    data_type: data_type_from_name(r.get::<_, String>(2)?),
-                    nullable: r.get::<_, i64>(3)? == 0,
-                    comment: None,
-                })
+                Ok((
+                    ColumnMeta {
+                        name: r.get(1)?,
+                        data_type: data_type_from_name(r.get::<_, String>(2)?),
+                        nullable: r.get::<_, i64>(3)? == 0,
+                        comment: None,
+                    },
+                    r.get::<_, i64>(5)? != 0, // pk flag (position in PK)
+                ))
             })
             .map_err(|e| Error::Query(e.to_string()))?;
         let mut columns = Vec::new();
+        let mut primary_keys = Vec::new();
         for row in rows {
-            columns.push(row.map_err(|e| Error::Query(e.to_string()))?);
+            let (col, pk) = row.map_err(|e| Error::Query(e.to_string()))?;
+            if pk {
+                primary_keys.push(col.name.clone());
+            }
+            columns.push(col);
         }
-        Ok(TableDetail { columns })
+
+        // PRAGMA foreign_key_list: rows grouped by `id`, one row per column.
+        // The pragma exposes no constraint name → keep `name: None`.
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA foreign_key_list({})", quote_ident(name)))
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,    // id
+                    r.get::<_, i64>(1)?,    // seq
+                    r.get::<_, String>(2)?, // parent table
+                    r.get::<_, String>(3)?, // from (local column)
+                    r.get::<_, Option<String>>(4)?, // to (ref column)
+                    r.get::<_, String>(5)?, // on_update
+                    r.get::<_, String>(6)?, // on_delete
+                ))
+            })
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut grouped: Vec<(i64, ForeignKeyMeta)> = Vec::new();
+        for row in rows {
+            let (id, _seq, ref_table, from, to, on_update, on_delete) =
+                row.map_err(|e| Error::Query(e.to_string()))?;
+            match grouped.iter_mut().find(|(gid, _)| *gid == id) {
+                Some((_, fk)) => {
+                    fk.columns.push(from);
+                    if let Some(to) = to {
+                        fk.ref_columns.push(to);
+                    }
+                }
+                None => grouped.push((
+                    id,
+                    ForeignKeyMeta {
+                        name: None,
+                        columns: vec![from],
+                        ref_table,
+                        ref_columns: to.into_iter().collect(),
+                        on_delete: Some(on_delete),
+                        on_update: Some(on_update),
+                    },
+                )),
+            }
+        }
+        let foreign_keys = grouped.into_iter().map(|(_, fk)| fk).collect();
+        Ok(TableDetail {
+            columns,
+            primary_keys,
+            foreign_keys,
+        })
     }
 
     async fn execute(&self, req: ExecuteRequest) -> Result<QueryResult> {
@@ -216,5 +272,93 @@ fn sqlite_value(v: ValueRef<'_>) -> CellValue {
         ValueRef::Real(f) => CellValue::Float(f),
         ValueRef::Text(t) => CellValue::Text(String::from_utf8_lossy(t).into_owned()),
         ValueRef::Blob(b) => CellValue::Bytes(b.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> SqliteClient {
+        let conn = Connection::open_in_memory().expect(":memory:");
+        conn.execute_batch(
+            "CREATE TABLE clientes (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL);
+             CREATE TABLE pedidos (
+                 id INTEGER PRIMARY KEY,
+                 cliente_id INTEGER NOT NULL,
+                 ord_no INTEGER,
+                 fecha TEXT,
+                 FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+                     ON DELETE CASCADE ON UPDATE SET NULL
+             );
+             CREATE TABLE lineas (
+                 id INTEGER PRIMARY KEY,
+                 pedido_id INTEGER NOT NULL,
+                 ord INTEGER NOT NULL,
+                 producto TEXT,
+                 FOREIGN KEY (pedido_id, ord) REFERENCES pedidos(id, ord_no)
+             );",
+        )
+        .expect("schema");
+        SqliteClient {
+            conn: Mutex::new(conn),
+            file_label: "test.db".into(),
+        }
+    }
+
+    fn obj(path: &[&str]) -> ObjectRef {
+        let mut r = ObjectRef::root(Default::default());
+        for seg in path {
+            r = r.child(*seg);
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn describe_reports_columns_primary_key_and_foreign_keys() {
+        let c = client();
+        let detail = c
+            .describe_table(&obj(&["test.db", "pedidos"]))
+            .await
+            .expect("describe");
+        assert_eq!(
+            detail.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id", "cliente_id", "ord_no", "fecha"]
+        );
+        assert_eq!(detail.primary_keys, vec!["id"]);
+
+        assert_eq!(detail.foreign_keys.len(), 1);
+        let fk = &detail.foreign_keys[0];
+        assert_eq!(fk.columns, vec!["cliente_id"]);
+        assert_eq!(fk.ref_table, "clientes");
+        assert_eq!(fk.ref_columns, vec!["id"]);
+        assert_eq!(fk.on_delete.as_deref(), Some("CASCADE"));
+        assert_eq!(fk.on_update.as_deref(), Some("SET NULL"));
+    }
+
+    #[tokio::test]
+    async fn describe_groups_multi_column_foreign_keys() {
+        let c = client();
+        let detail = c
+            .describe_table(&obj(&["test.db", "lineas"]))
+            .await
+            .expect("describe");
+        assert_eq!(detail.foreign_keys.len(), 1, "one constraint, two rows");
+        let fk = &detail.foreign_keys[0];
+        assert_eq!(fk.columns, vec!["pedido_id", "ord"]);
+        assert_eq!(fk.ref_columns, vec!["id", "ord_no"]);
+        assert_eq!(fk.ref_table, "pedidos");
+        assert_eq!(fk.name, None, "PRAGMA exposes no constraint name");
+    }
+
+    #[tokio::test]
+    async fn describe_table_without_constraints_is_empty() {
+        let c = client();
+        let detail = c
+            .describe_table(&obj(&["test.db", "clientes"]))
+            .await
+            .expect("describe");
+        assert_eq!(detail.primary_keys, vec!["id"]);
+        assert!(detail.foreign_keys.is_empty());
     }
 }
