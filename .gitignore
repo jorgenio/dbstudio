@@ -3,3 +3,4 @@
 *.log
 sample/*.db
 
+commit_msg.txt
