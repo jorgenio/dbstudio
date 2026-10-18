@@ -107,6 +107,36 @@ impl DesignerState {
         }
     }
 
+    /// Document that diffs a desired `source` structure against the
+    /// `target` currently stored at `table` (`None` = target table is
+    /// missing, so the source is created from scratch). Used by `sync`.
+    pub fn for_sync(
+        connection: ConnectionId,
+        table: ObjectRef,
+        source: &dbstudio_drivers::TableDetail,
+        target: Option<&dbstudio_drivers::TableDetail>,
+    ) -> Self {
+        let mut state = Self::from_table(connection, table, source.clone());
+        match target {
+            Some(t) => {
+                let pks: Vec<String> = t.primary_keys.clone();
+                let columns: Vec<ColRow> = t
+                    .columns
+                    .iter()
+                    .map(|meta| {
+                        let pk = pks.iter().any(|k| k.eq_ignore_ascii_case(&meta.name));
+                        ColRow::from_meta(meta, pk)
+                    })
+                    .collect();
+                state.existing = Some(columns);
+                state.original_pks = pks;
+            }
+            // No baseline: preview falls through to a plain CREATE TABLE.
+            None => state.existing = None,
+        }
+        state
+    }
+
     pub fn apply(&mut self, msg: DesignMsg) {
         match msg {
             DesignMsg::Name(name) => {

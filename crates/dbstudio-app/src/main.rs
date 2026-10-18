@@ -9,6 +9,7 @@ mod export;
 mod form;
 mod grid;
 mod store;
+mod sync;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -114,6 +115,10 @@ struct App {
     designer: Option<designer::DesignerState>,
     /// Connection whose `describe_table` is in flight for the designer.
     design_pending: Option<ConnectionId>,
+    /// Structure-sync overlay and the destination whose describe is in
+    /// flight (stale batches are discarded by matching this).
+    sync: Option<SyncState>,
+    sync_pending: Option<ConnectionId>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -186,6 +191,14 @@ enum Message {
     DesignApply,
     DesignApplied(Result<usize, String>),
     DesignClose,
+    /// Structure sync: open against the selected table, pick the
+    /// destination connection, load both sides, apply, close.
+    SyncOpen,
+    SyncDest(ConnectionId),
+    SyncLoaded(Result<SyncPayload, String>),
+    SyncApply,
+    SyncApplied(Result<usize, String>),
+    SyncClose,
     /// Copy selected rows (all when nothing is selected) as TSV.
     CopyValues,
     /// Copy rows as TSV with a header line of column names.
@@ -236,6 +249,27 @@ type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>)
 /// and its structure. Err is a plain string so batches stay attributable
 /// without carrying the request context.
 type DesignerPayload = (ConnectionId, ObjectRef, drivers::TableDetail);
+
+/// Ok payload of `SyncLoaded`: source table + structure, destination
+/// connection/table and its structure (`None` = table missing there, so
+/// the plan is a plain CREATE TABLE).
+type SyncPayload = (
+    ObjectRef,
+    drivers::TableDetail,
+    ConnectionId,
+    ObjectRef,
+    Option<drivers::TableDetail>,
+);
+
+/// Open structure-sync overlay: both sides loaded and ready to diff.
+#[derive(Clone, Debug)]
+struct SyncState {
+    source: ObjectRef,
+    source_detail: drivers::TableDetail,
+    target_conn: ConnectionId,
+    target: ObjectRef,
+    target_detail: Option<drivers::TableDetail>,
+}
 
 /// SQL completion popup: the word being typed, the dictionary it filters and
 /// the highlighted candidate. The dictionary is loaded once per connection by
@@ -375,6 +409,8 @@ fn boot() -> (App, Task<Message>) {
             er: None,
             designer: None,
             design_pending: None,
+            sync: None,
+            sync_pending: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -589,6 +625,83 @@ fn design_apply_task(
     )
 }
 
+/// Describe both sides of a structure sync. A destination table that does
+/// not exist (or cannot be read) is not an error: the plan falls back to
+/// `CREATE TABLE`.
+fn sync_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    src_client: Arc<dyn drivers::DatabaseClient>,
+    source: ObjectRef,
+    dst_client: Arc<dyn drivers::DatabaseClient>,
+    target: ObjectRef,
+    target_conn: ConnectionId,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let rt2 = rt.clone();
+            let (source, source_detail) = rt
+                .spawn({
+                    let source = source.clone();
+                    async move {
+                        src_client
+                            .describe_table(&source)
+                            .await
+                            .map(|d| (source, d))
+                            .map_err(|e| e.to_string())
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+            let target_ref = target.clone();
+            let target_detail = rt2
+                .spawn(async move {
+                    dst_client
+                        .describe_table(&target_ref)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .ok()
+                .and_then(Result::ok);
+            Ok::<SyncPayload, String>((
+                source,
+                source_detail,
+                target_conn,
+                target,
+                target_detail,
+            ))
+        },
+        Message::SyncLoaded,
+    )
+}
+
+/// Run migration statements on a destination connection for the sync
+/// overlay (same sequential semantics as `design_apply_task`).
+fn sync_apply_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    stmts: Vec<String>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let mut applied = 0usize;
+                for stmt in stmts {
+                    client
+                        .execute(ExecuteRequest::new(&stmt))
+                        .await
+                        .map_err(|e| format!("{stmt}\n  → {e}"))?;
+                    applied += 1;
+                }
+                Ok::<usize, String>(applied)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::SyncApplied,
+    )
+}
+
 impl App {
     fn refresh_search(&mut self) {
         let names: Vec<String> = self.entries.iter().map(|e| e.cfg.name.clone()).collect();
@@ -710,6 +823,8 @@ impl App {
                 self.root = Some(ObjectRef::root(id));
                 self.query_context = None;
                 self.selected_object = None;
+                self.sync = None;
+                self.sync_pending = None;
                 self.completion.close();
                 self.completion.dictionary = self
                     .completion_words
@@ -757,6 +872,14 @@ impl App {
                 }
                 if self.design_pending == Some(removed.cfg.id) {
                     self.design_pending = None;
+                }
+                if self.sync.as_ref().is_some_and(|s| {
+                    s.source.connection == removed.cfg.id || s.target_conn == removed.cfg.id
+                }) {
+                    self.sync = None;
+                }
+                if self.sync_pending == Some(removed.cfg.id) {
+                    self.sync_pending = None;
                 }
                 if self
                     .selected_object
@@ -890,6 +1013,14 @@ impl App {
                             }
                             if self.design_pending == Some(cfg.id) {
                                 self.design_pending = None;
+                            }
+                            if self.sync.as_ref().is_some_and(|s| {
+                                s.source.connection == cfg.id || s.target_conn == cfg.id
+                            }) {
+                                self.sync = None;
+                            }
+                            if self.sync_pending == Some(cfg.id) {
+                                self.sync_pending = None;
                             }
                             if self.active_id == Some(cfg.id) {
                                 self.root = None;
@@ -1087,6 +1218,8 @@ impl App {
                 self.completion.close();
                 self.designer = None;
                 self.design_pending = None;
+                self.sync = None;
+                self.sync_pending = None;
                 self.er = Some(ErState {
                     connection: id,
                     diagram: None,
@@ -1157,6 +1290,8 @@ impl App {
                 }
                 let parent = design_parent(id, self.selected_object.as_ref());
                 self.er = None;
+                self.sync = None;
+                self.sync_pending = None;
                 self.completion.close();
                 self.design_pending = None;
                 self.designer = Some(designer::DesignerState::new_table(id, parent));
@@ -1177,6 +1312,8 @@ impl App {
                     return Task::none();
                 };
                 self.er = None;
+                self.sync = None;
+                self.sync_pending = None;
                 self.completion.close();
                 self.design_pending = Some(obj.connection);
                 self.status = format!("cargando estructura de {}…", obj.path.last().cloned().unwrap_or_default());
@@ -1260,6 +1397,155 @@ impl App {
             Message::DesignClose => {
                 self.designer = None;
                 self.design_pending = None;
+                Task::none()
+            }
+            Message::SyncOpen => {
+                let Some((obj, kind)) = self.selected_object.clone() else {
+                    self.status =
+                        "selecciona la tabla de origen en el árbol".to_string();
+                    return Task::none();
+                };
+                if kind != ObjectKind::Table {
+                    self.status = "la sincronización necesita una tabla origen".to_string();
+                    return Task::none();
+                }
+                let Some(src_session) = self.sessions.get(&obj.connection).cloned() else {
+                    self.status = "la conexión de origen no está activa".to_string();
+                    return Task::none();
+                };
+                let Some(dst) = self
+                    .entries
+                    .iter()
+                    .find(|e| e.cfg.id != obj.connection && self.sessions.contains_key(&e.cfg.id))
+                    .map(|e| e.cfg.id)
+                else {
+                    self.status =
+                        "conecta otra base de datos para usarla como destino".to_string();
+                    return Task::none();
+                };
+                let Some(dst_session) = self.sessions.get(&dst).cloned() else {
+                    return Task::none();
+                };
+                let target = ObjectRef { connection: dst, path: obj.path.clone() };
+                self.er = None;
+                self.designer = None;
+                self.design_pending = None;
+                self.completion.close();
+                self.sync_pending = Some(dst);
+                self.status = "comparando estructura origen → destino…".to_string();
+                sync_task(
+                    self.rt.clone(),
+                    src_session.client.clone(),
+                    obj,
+                    dst_session.client.clone(),
+                    target,
+                    dst,
+                )
+            }
+            Message::SyncDest(dst) => {
+                let Some(state) = &self.sync else {
+                    return Task::none();
+                };
+                if dst == state.target_conn || self.sync_pending == Some(dst) {
+                    return Task::none();
+                }
+                let Some(src_session) = self.sessions.get(&state.source.connection).cloned() else {
+                    self.status = "la conexión de origen no está activa".to_string();
+                    return Task::none();
+                };
+                let Some(dst_session) = self.sessions.get(&dst).cloned() else {
+                    self.status = "esa conexión destino no está activa".to_string();
+                    return Task::none();
+                };
+                let source = state.source.clone();
+                let target = ObjectRef { connection: dst, path: source.path.clone() };
+                self.sync_pending = Some(dst);
+                self.status = "comparando estructura origen → destino…".to_string();
+                sync_task(
+                    self.rt.clone(),
+                    src_session.client.clone(),
+                    source,
+                    dst_session.client.clone(),
+                    target,
+                    dst,
+                )
+            }
+            Message::SyncLoaded(Ok((source, source_detail, dst, target, target_detail))) => {
+                if self.sync_pending != Some(dst) {
+                    return Task::none();
+                }
+                self.sync_pending = None;
+                self.sync = Some(SyncState {
+                    source,
+                    source_detail,
+                    target_conn: dst,
+                    target,
+                    target_detail,
+                });
+                self.status = if self
+                    .sync
+                    .as_ref()
+                    .is_some_and(|s| s.target_detail.is_none())
+                {
+                    "tabla destino no existe: se creará completa".to_string()
+                } else {
+                    "estructura comparada: revisa el plan".to_string()
+                };
+                Task::none()
+            }
+            Message::SyncLoaded(Err(e)) => {
+                if self.sync_pending.take().is_some() {
+                    self.status = format!("error al comparar: {e}");
+                }
+                Task::none()
+            }
+            Message::SyncApply => {
+                let Some(state) = &self.sync else {
+                    return Task::none();
+                };
+                let engine = self.engine_of(state.target_conn);
+                let stmts: Vec<String> = sync::plan(
+                    engine,
+                    &state.source_detail,
+                    state.target_detail.as_ref(),
+                    &state.target,
+                )
+                .statements
+                .into_iter()
+                .filter(|s| !s.trim_start().starts_with("--"))
+                .collect();
+                if stmts.is_empty() {
+                    self.status = "el destino ya coincide con el origen".to_string();
+                    return Task::none();
+                }
+                let Some(session) = self.sessions.get(&state.target_conn).cloned() else {
+                    self.status = "la conexión destino no está activa".to_string();
+                    return Task::none();
+                };
+                self.status = format!("aplicando {} sentencia(s) en el destino…", stmts.len());
+                sync_apply_task(self.rt.clone(), session.client.clone(), stmts)
+            }
+            Message::SyncApplied(Ok(n)) => {
+                self.status = format!("✓ {n} sentencia(s) aplicadas en el destino");
+                if let Some(state) = self.sync.take() {
+                    self.invalidate_after_ddl(&state.target);
+                    if Some(state.target_conn) == self.active_id {
+                        if let Some(parent) = state.target.parent() {
+                            self.expanded.remove(&parent);
+                            self.tree.remove(&parent);
+                            return self.expand(&parent);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SyncApplied(Err(e)) => {
+                self.status = format!("error al migrar: {e}");
+                Task::none()
+            }
+            Message::SyncClose => {
+                self.sync = None;
+                self.sync_pending = None;
                 Task::none()
             }
             Message::CopyValues => self.copy_rows(false),
@@ -1717,6 +2003,168 @@ impl App {
             .into()
     }
 
+    /// Workspace shown while a structure sync is open: destination picker
+    /// over the action grid + migration SQL preview.
+    fn sync_view<'a>(&'a self, s: &'a SyncState) -> Element<'a, Message> {
+        let dst_name = self
+            .entries
+            .iter()
+            .find(|e| e.cfg.id == s.target_conn)
+            .map(|e| e.cfg.name.clone())
+            .unwrap_or_else(|| "destino".to_string());
+        let table = s.source.path.last().cloned().unwrap_or_default();
+
+        let mut dest_picker = row![text("Destino:").size(11).color(theme::muted())].spacing(6);
+        for e in &self.entries {
+            if e.cfg.id == s.source.connection || !self.sessions.contains_key(&e.cfg.id) {
+                continue;
+            }
+            let active = e.cfg.id == s.target_conn && self.sync_pending.is_none();
+            dest_picker = dest_picker.push(
+                button(text(e.cfg.name.clone()).size(12))
+                    .padding([4, 8])
+                    .style(if active { theme::solid } else { theme::flat })
+                    .on_press(Message::SyncDest(e.cfg.id)),
+            );
+        }
+
+        let strip = container(
+            row![
+                text(format!("Sincronizar: {table}")).size(13),
+                dest_picker,
+                container(
+                    row![
+                        button(text("✓ Aplicar").size(12))
+                            .on_press_maybe(self.sync_pending.is_none().then_some(Message::SyncApply))
+                            .style(theme::solid),
+                        button(text("✕ Volver").size(12))
+                            .on_press(Message::SyncClose)
+                            .style(theme::flat),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+        .style(theme::chrome);
+
+        let body: Element<'_, Message> = if self.sync_pending.is_some() {
+            container(
+                text("comparando estructura origen → destino…")
+                    .size(13)
+                    .color(theme::muted()),
+            )
+            .padding(16)
+            .into()
+        } else {
+            let engine = self.engine_of(s.target_conn);
+            let plan = sync::plan(
+                engine,
+                &s.source_detail,
+                s.target_detail.as_ref(),
+                &s.target,
+            );
+
+            let mut header = row![].spacing(6).align_y(iced::Alignment::Center);
+            for (label, w) in [
+                ("Columna", 150.0),
+                ("Acción", 110.0),
+                ("Origen", 170.0),
+                ("Destino", 170.0),
+            ] {
+                header = header.push(
+                    text(label)
+                        .size(11)
+                        .color(theme::muted())
+                        .width(Length::Fixed(w)),
+                );
+            }
+            header = header.push(text(" ").size(11).width(Length::Fill));
+
+            let mut rows = Column::new().push(header).spacing(4);
+            for row_data in &plan.rows {
+                let action = text(row_data.action.label())
+                    .size(13)
+                    .width(Length::Fixed(110.0));
+                let action = if row_data.action == sync::Action::Keep {
+                    action.color(theme::muted())
+                } else {
+                    action
+                };
+                rows = rows.push(
+                    row![
+                        text(row_data.column.clone())
+                            .size(13)
+                            .width(Length::Fixed(150.0)),
+                        action,
+                        text(row_data.source.clone())
+                            .size(13)
+                            .color(theme::muted())
+                            .width(Length::Fixed(170.0)),
+                        text(row_data.target.clone())
+                            .size(13)
+                            .color(theme::muted())
+                            .width(Length::Fixed(170.0)),
+                        text(" ").size(13).width(Length::Fill),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+
+            let runnable: Vec<&String> = plan
+                .statements
+                .iter()
+                .filter(|st| !st.trim_start().starts_with("--"))
+                .collect();
+            let sql = if plan.statements.is_empty() {
+                "-- sin diferencias: el destino ya coincide".to_string()
+            } else {
+                plan.statements.join("\n")
+            };
+            let preview_pane = container(
+                scrollable(text(sql).size(12).font(iced::Font::MONOSPACE))
+                    .height(Length::Fixed(170.0)),
+            )
+            .padding(10)
+            .style(theme::workspace);
+
+            scrollable(
+                container(
+                    Column::new()
+                        .push(rows)
+                        .push(
+                            text(format!(
+                                "SQL a aplicar en {} ({} sentencia(s) ejecutables)",
+                                dst_name,
+                                runnable.len()
+                            ))
+                            .size(11)
+                            .color(theme::muted()),
+                        )
+                        .push(preview_pane)
+                        .spacing(8),
+                )
+                .padding(10),
+            )
+            .height(Length::Fill)
+            .into()
+        };
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(body)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         // ── custom title bar: brand + actions + window controls ─────────
         // Frameless window: the bar replaces the native title bar, so it is
@@ -1771,6 +2219,19 @@ impl App {
                         .as_ref()
                         .is_some_and(|(o, k)| *k == ObjectKind::Table && self.sessions.contains_key(&o.connection))
                         .then_some(Message::DesignSelected),
+                )
+                .style(theme::flat),
+            button(text("⇄ Sincronizar").size(13))
+                .on_press_maybe(
+                    self.selected_object.as_ref().is_some_and(|(o, k)| {
+                        *k == ObjectKind::Table
+                            && self.sessions.contains_key(&o.connection)
+                            && self
+                                .sessions
+                                .keys()
+                                .any(|id| *id != o.connection)
+                    })
+                    .then_some(Message::SyncOpen),
                 )
                 .style(theme::flat),
             rule::vertical(1).style(theme::hairline),
@@ -1969,11 +2430,12 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        // The designer/ER overlays replace the editor + results while open.
-        let center: Element<'_, Message> = match (&self.designer, &self.er) {
-            (Some(d), _) => self.designer_view(d),
-            (None, Some(er)) => self.er_view(er),
-            (None, None) => Column::new()
+        // The sync/designer/ER overlays replace the editor + results while open.
+        let center: Element<'_, Message> = match (&self.sync, &self.designer, &self.er) {
+            (Some(s), _, _) => self.sync_view(s),
+            (None, Some(d), _) => self.designer_view(d),
+            (None, None, Some(er)) => self.er_view(er),
+            (None, None, None) => Column::new()
                 .push(editor_tabs)
                 .push(editor.height(Length::FillPortion(2)))
                 .push(rule::horizontal(1).style(theme::hairline))
