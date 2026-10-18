@@ -3,6 +3,7 @@
 //! editor runs statements through `dbstudio-drivers` and the result grid is
 //! rebuilt from the driver's normalized `QueryResult`.
 
+mod designer;
 mod er;
 mod export;
 mod form;
@@ -109,6 +110,12 @@ struct App {
     next_tab: usize,
     /// Open ER diagram overlay, when the workspace shows it.
     er: Option<ErState>,
+    /// Open table designer overlay (mutually exclusive with `er`).
+    designer: Option<designer::DesignerState>,
+    /// Connection whose `describe_table` is in flight for the designer.
+    design_pending: Option<ConnectionId>,
+    /// Last object opened from the tree: seeds the designer's target.
+    selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
     tree: HashMap<ObjectRef, Vec<ObjectNode>>,
     expanded: HashSet<ObjectRef>,
@@ -170,6 +177,15 @@ enum Message {
     ErOpen,
     ErClose,
     ErLoaded(Result<er::ErPayload, String>),
+    /// Table designer: open new / open from selected table, grid edits,
+    /// apply the previewed DDL, close.
+    DesignNew,
+    DesignSelected,
+    DesignerLoaded(Result<DesignerPayload, String>),
+    Design(designer::DesignMsg),
+    DesignApply,
+    DesignApplied(Result<usize, String>),
+    DesignClose,
     /// Copy selected rows (all when nothing is selected) as TSV.
     CopyValues,
     /// Copy rows as TSV with a header line of column names.
@@ -215,6 +231,11 @@ enum Message {
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
+
+/// Ok payload of `DesignerLoaded`: connection, the table being described
+/// and its structure. Err is a plain string so batches stay attributable
+/// without carrying the request context.
+type DesignerPayload = (ConnectionId, ObjectRef, drivers::TableDetail);
 
 /// SQL completion popup: the word being typed, the dictionary it filters and
 /// the highlighted candidate. The dictionary is loaded once per connection by
@@ -352,6 +373,9 @@ fn boot() -> (App, Task<Message>) {
             active_tab: 0,
             next_tab: 2,
             er: None,
+            designer: None,
+            design_pending: None,
+            selected_object: None,
             root: None,
             tree: HashMap::new(),
             expanded: HashSet::new(),
@@ -457,6 +481,34 @@ fn active_after_close(len: usize, active: usize, closed: usize) -> usize {
     }
 }
 
+/// True when `k` is `target` itself or lives under it (same connection).
+/// Used to drop stale navigator caches after a DDL apply.
+fn is_under(target: &ObjectRef, k: &ObjectRef) -> bool {
+    k.connection == target.connection
+        && k.path.len() >= target.path.len()
+        && k.path[..target.path.len()] == target.path[..]
+}
+
+/// Container a new table would live in, derived from the last object the
+/// user opened: its database/schema, its parent (for tables), or the
+/// connection root when nothing is selected.
+fn design_parent(id: ConnectionId, selected: Option<&(ObjectRef, ObjectKind)>) -> ObjectRef {
+    match selected {
+        Some((obj, kind))
+            if obj.connection == id
+                && matches!(kind, ObjectKind::Database | ObjectKind::Schema) =>
+        {
+            obj.clone()
+        }
+        Some((obj, kind))
+            if obj.connection == id && matches!(kind, ObjectKind::Table | ObjectKind::View) =>
+        {
+            obj.parent().unwrap_or_else(|| ObjectRef::root(id))
+        }
+        _ => ObjectRef::root(id),
+    }
+}
+
 /// Discover the connection's tables and describe them all in one hop.
 fn er_task(
     rt: Arc<tokio::runtime::Runtime>,
@@ -479,6 +531,61 @@ fn er_task(
             })
         },
         Message::ErLoaded,
+    )
+}
+
+/// Describe one table for the designer overlay.
+fn design_describe_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    table: ObjectRef,
+) -> Task<Message> {
+    let reply = table.clone();
+    Task::perform(
+        async move {
+            let res: Result<_, String> = rt
+                .spawn(async move {
+                    client
+                        .describe_table(&table)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            res.map(|detail| (reply, detail))
+        },
+        move |res| {
+            Message::DesignerLoaded(res.map(|(table, detail)| {
+                (table.connection, table, detail)
+            }))
+        },
+    )
+}
+
+/// Run the designer's DDL statements sequentially; `Ok(n)` counts the ones
+/// that completed before any failure stopped the batch.
+fn design_apply_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    stmts: Vec<String>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let mut applied = 0usize;
+                for stmt in stmts {
+                    client
+                        .execute(ExecuteRequest::new(&stmt))
+                        .await
+                        .map_err(|e| format!("{stmt}\n  → {e}"))?;
+                    applied += 1;
+                }
+                Ok::<usize, String>(applied)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::DesignApplied,
     )
 }
 
@@ -602,6 +709,7 @@ impl App {
                 self.active_id = Some(id);
                 self.root = Some(ObjectRef::root(id));
                 self.query_context = None;
+                self.selected_object = None;
                 self.completion.close();
                 self.completion.dictionary = self
                     .completion_words
@@ -643,6 +751,19 @@ impl App {
                 self.completion_words.remove(&removed.cfg.id);
                 if self.er.as_ref().is_some_and(|e| e.connection == removed.cfg.id) {
                     self.er = None;
+                }
+                if self.designer.as_ref().is_some_and(|d| d.connection == removed.cfg.id) {
+                    self.designer = None;
+                }
+                if self.design_pending == Some(removed.cfg.id) {
+                    self.design_pending = None;
+                }
+                if self
+                    .selected_object
+                    .as_ref()
+                    .is_some_and(|(o, _)| o.connection == removed.cfg.id)
+                {
+                    self.selected_object = None;
                 }
                 for tab in &mut self.tabs {
                     if tab.connection == Some(removed.cfg.id) {
@@ -764,6 +885,12 @@ impl App {
                             self.completion_words.remove(&cfg.id);
                             self.tree.retain(|k, _| k.connection != cfg.id);
                             self.expanded.retain(|k| k.connection != cfg.id);
+                            if self.designer.as_ref().is_some_and(|d| d.connection == cfg.id) {
+                                self.designer = None;
+                            }
+                            if self.design_pending == Some(cfg.id) {
+                                self.design_pending = None;
+                            }
                             if self.active_id == Some(cfg.id) {
                                 self.root = None;
                                 self.query_context = None;
@@ -859,6 +986,7 @@ impl App {
                     ObjectKind::Collection => Some(obj.path.join(".")),
                     _ => None,
                 };
+                self.selected_object = Some((obj.clone(), kind));
                 let expand = self.expand(&obj);
                 self.completion.close();
                 let edit = self.editor.reset(&sql).map(Message::Editor);
@@ -957,6 +1085,8 @@ impl App {
                     return Task::none();
                 };
                 self.completion.close();
+                self.designer = None;
+                self.design_pending = None;
                 self.er = Some(ErState {
                     connection: id,
                     diagram: None,
@@ -1012,6 +1142,124 @@ impl App {
             }
             Message::ErClose => {
                 self.er = None;
+                Task::none()
+            }
+            Message::DesignNew => {
+                let Some(id) = self.active_id else {
+                    self.status = "selecciona una conexión para diseñar una tabla".to_string();
+                    return Task::none();
+                };
+                let engine = self.engine_of(id);
+                if engine == Engine::Mongodb {
+                    self.status =
+                        "MongoDB no usa diseñador de tablas (esquema dinámico)".to_string();
+                    return Task::none();
+                }
+                let parent = design_parent(id, self.selected_object.as_ref());
+                self.er = None;
+                self.completion.close();
+                self.design_pending = None;
+                self.designer = Some(designer::DesignerState::new_table(id, parent));
+                self.status = "diseñador: nueva tabla — define columnas y aplica".to_string();
+                Task::none()
+            }
+            Message::DesignSelected => {
+                let Some((obj, kind)) = self.selected_object.clone() else {
+                    self.status = "abre una tabla en el árbol para diseñarla".to_string();
+                    return Task::none();
+                };
+                if kind != ObjectKind::Table {
+                    self.status = "selecciona una tabla (no una vista)".to_string();
+                    return Task::none();
+                }
+                let Some(session) = self.sessions.get(&obj.connection).cloned() else {
+                    self.status = "la conexión de esa tabla no está activa".to_string();
+                    return Task::none();
+                };
+                self.er = None;
+                self.completion.close();
+                self.design_pending = Some(obj.connection);
+                self.status = format!("cargando estructura de {}…", obj.path.last().cloned().unwrap_or_default());
+                design_describe_task(self.rt.clone(), session.client.clone(), obj)
+            }
+            Message::DesignerLoaded(Ok((id, table, detail))) => {
+                // Discard batches that arrive after the overlay moved on.
+                if self.design_pending != Some(id) {
+                    return Task::none();
+                }
+                self.design_pending = None;
+                let name = table
+                    .path
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "tabla".to_string());
+                self.designer =
+                    Some(designer::DesignerState::from_table(id, table, detail));
+                self.status = format!("diseñador: {name}");
+                Task::none()
+            }
+            Message::DesignerLoaded(Err(e)) => {
+                if let Some(id) = self.design_pending.take() {
+                    if let Some(name) = self
+                        .entries
+                        .iter()
+                        .find(|e| e.cfg.id == id)
+                        .map(|e| e.cfg.name.clone())
+                    {
+                        self.status = format!("error al describir ({name}): {e}");
+                    } else {
+                        self.status = format!("error al describir la tabla: {e}");
+                    }
+                }
+                Task::none()
+            }
+            Message::Design(msg) => {
+                if let Some(d) = &mut self.designer {
+                    d.apply(msg);
+                }
+                Task::none()
+            }
+            Message::DesignApply => {
+                let Some(d) = &self.designer else {
+                    return Task::none();
+                };
+                let engine = self.engine_of(d.connection);
+                let stmts: Vec<String> = designer::preview(engine, d)
+                    .into_iter()
+                    .filter(|s| !s.trim_start().starts_with("--"))
+                    .collect();
+                if stmts.is_empty() {
+                    self.status = "sin cambios que aplicar".to_string();
+                    return Task::none();
+                }
+                let Some(session) = self.sessions.get(&d.connection).cloned() else {
+                    self.status = "la conexión no está activa — selecciónala de nuevo".to_string();
+                    return Task::none();
+                };
+                self.status = format!("aplicando {} sentencia(s)…", stmts.len());
+                design_apply_task(self.rt.clone(), session.client.clone(), stmts)
+            }
+            Message::DesignApplied(Ok(n)) => {
+                self.status = format!("✓ {n} sentencia(s) aplicadas");
+                if let Some(d) = self.designer.take() {
+                    let target = d.target();
+                    self.invalidate_after_ddl(&target);
+                    // Reload the parent listing so new tables show up.
+                    if let Some(parent) = target.parent() {
+                        self.expanded.remove(&parent);
+                        self.tree.remove(&parent);
+                        return self.expand(&parent);
+                    }
+                }
+                Task::none()
+            }
+            Message::DesignApplied(Err(e)) => {
+                self.status = format!("error al aplicar: {e}");
+                Task::none()
+            }
+            Message::DesignClose => {
+                self.designer = None;
+                self.design_pending = None;
                 Task::none()
             }
             Message::CopyValues => self.copy_rows(false),
@@ -1279,6 +1527,23 @@ impl App {
         }
     }
 
+    /// Engine of a connection id (defaults to SQLite for display paths that
+    /// run before any entry is loaded).
+    fn engine_of(&self, id: ConnectionId) -> Engine {
+        self.entries
+            .iter()
+            .find(|e| e.cfg.id == id)
+            .map(|e| e.cfg.engine)
+            .unwrap_or(Engine::Sqlite)
+    }
+
+    /// Drop cached children/expansion for `target` and everything under it
+    /// so the navigator refetches after a DDL apply.
+    fn invalidate_after_ddl(&mut self, target: &ObjectRef) {
+        self.tree.retain(|k, _| !is_under(target, k));
+        self.expanded.retain(|k| !is_under(target, k));
+    }
+
     /// Toggle (or lazily load) the children of a navigator node.
     fn expand(&mut self, node: &ObjectRef) -> Task<Message> {
         if self.expanded.contains(node) {
@@ -1395,6 +1660,63 @@ impl App {
             .into()
     }
 
+    /// Workspace shown while the table designer is open: header strip with
+    /// apply/close actions over the column grid + SQL preview.
+    fn designer_view<'a>(&'a self, d: &'a designer::DesignerState) -> Element<'a, Message> {
+        let engine = self.engine_of(d.connection);
+        let conn_name = self
+            .entries
+            .iter()
+            .find(|e| e.cfg.id == d.connection)
+            .map(|e| e.cfg.name.clone())
+            .unwrap_or_else(|| "conexión".to_string());
+        let title = match &d.table {
+            Some(t) => format!(
+                "Diseñador: {}",
+                t.path.last().cloned().unwrap_or_default()
+            ),
+            None => "Diseñador: nueva tabla".to_string(),
+        };
+        let strip = container(
+            row![
+                text(title).size(13),
+                text(conn_name).size(12).color(theme::muted()),
+                container(
+                    row![
+                        button(text("✓ Aplicar").size(12))
+                            .on_press(Message::DesignApply)
+                            .style(theme::solid),
+                        button(text("✕ Volver").size(12))
+                            .on_press(Message::DesignClose)
+                            .style(theme::flat),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
+        .style(theme::chrome);
+
+        let body: Element<'_, Message> = scrollable(
+            container(designer::view(d, engine).map(Message::Design)).padding(10),
+        )
+        .height(Length::Fill)
+        .into();
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(body)
+            .width(Length::Fill)
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         // ── custom title bar: brand + actions + window controls ─────────
         // Frameless window: the bar replaces the native title bar, so it is
@@ -1435,6 +1757,21 @@ impl App {
                 .style(theme::flat),
             button(text("⇄ ER").size(13))
                 .on_press_maybe(self.active_id.is_some().then_some(Message::ErOpen))
+                .style(theme::flat),
+            button(text("＋ Tabla").size(13))
+                .on_press_maybe(
+                    (self.active_id.is_some()
+                        && self.engine_of(self.active_id.unwrap()) != Engine::Mongodb)
+                        .then_some(Message::DesignNew),
+                )
+                .style(theme::flat),
+            button(text("Diseñador").size(13))
+                .on_press_maybe(
+                    self.selected_object
+                        .as_ref()
+                        .is_some_and(|(o, k)| *k == ObjectKind::Table && self.sessions.contains_key(&o.connection))
+                        .then_some(Message::DesignSelected),
+                )
                 .style(theme::flat),
             rule::vertical(1).style(theme::hairline),
             container(auto_complete(
@@ -1632,10 +1969,11 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        // The ER overlay replaces the editor + results while it is open.
-        let center: Element<'_, Message> = match &self.er {
-            Some(er) => self.er_view(er),
-            None => Column::new()
+        // The designer/ER overlays replace the editor + results while open.
+        let center: Element<'_, Message> = match (&self.designer, &self.er) {
+            (Some(d), _) => self.designer_view(d),
+            (None, Some(er)) => self.er_view(er),
+            (None, None) => Column::new()
                 .push(editor_tabs)
                 .push(editor.height(Length::FillPortion(2)))
                 .push(rule::horizontal(1).style(theme::hairline))
@@ -2346,6 +2684,55 @@ mod tests {
     fn view_generates_select_like_table() {
         let sql = query_for_engine(Engine::Postgres, &obj(&["appdb", "public", "v_activos"]), ObjectKind::View);
         assert_eq!(sql, "SELECT * FROM \"public\".\"v_activos\" LIMIT 100;");
+    }
+
+    #[test]
+    fn design_parent_follows_the_selection() {
+        let id = ConnectionId::nil();
+        // Selected database/schema becomes the container itself.
+        assert_eq!(
+            design_parent(id, Some(&(obj(&["tienda"]), ObjectKind::Database))),
+            obj(&["tienda"])
+        );
+        assert_eq!(
+            design_parent(id, Some(&(obj(&["appdb", "public"]), ObjectKind::Schema))),
+            obj(&["appdb", "public"])
+        );
+        // A table's container is its parent path.
+        assert_eq!(
+            design_parent(id, Some(&(obj(&["tienda", "pedidos"]), ObjectKind::Table))),
+            obj(&["tienda"])
+        );
+        // Collections and foreign connections fall back to the root.
+        assert_eq!(
+            design_parent(id, Some(&(obj(&["appdb", "usuarios"]), ObjectKind::Collection))),
+            ObjectRef::root(id)
+        );
+        assert_eq!(design_parent(id, None), ObjectRef::root(id));
+    }
+
+    #[test]
+    fn designer_apply_skips_comment_only_statements() {
+        let mut s = designer::DesignerState::new_table(
+            ConnectionId::nil(),
+            ObjectRef {
+                connection: ConnectionId::nil(),
+                path: vec!["demo.db".into()],
+            },
+        );
+        s.name = "nueva".into();
+        // An unnamed new table previews nothing; once named, the CREATE
+        // passes the filter while `--` limitation notes would not.
+        let run = |s: &designer::DesignerState| -> Vec<String> {
+            designer::preview(Engine::Sqlite, s)
+                .into_iter()
+                .filter(|st| !st.trim_start().starts_with("--"))
+                .collect()
+        };
+        assert!(run(&s).iter().all(|st| st.starts_with("CREATE TABLE")));
+        assert_eq!(run(&s).len(), 1);
+        s.name = "  ".into();
+        assert!(run(&s).is_empty());
     }
 }
 
