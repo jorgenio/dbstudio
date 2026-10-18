@@ -3,6 +3,9 @@
 //! editor runs statements through `dbstudio-drivers` and the result grid is
 //! rebuilt from the driver's normalized `QueryResult`.
 
+// Ship without a console window; debug builds keep it for panics/logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod designer;
 mod er;
 mod export;
