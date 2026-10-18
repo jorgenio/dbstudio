@@ -21,14 +21,14 @@ use std::sync::Arc;
 
 use dbstudio_core::{
     CellValue, ColumnMeta, ConnectionConfig, ConnectionId, Engine, ExecuteRequest, ObjectKind,
-    ObjectNode, ObjectRef, QueryResult,
+    ObjectNode, ObjectRef, QueryResult, TypeFamily,
 };
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
 use store::Connections;
 use iced::widget::{
-    button, column, container, row, rule, scrollable, stack, text, text_input, Column, MouseArea,
-    Space,
+    button, checkbox, column, container, row, rule, scrollable, stack, text, text_input, Column,
+    MouseArea, Space,
 };
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
@@ -71,6 +71,8 @@ struct Tab {
     last_row_count: usize,
     last_columns: Vec<ColumnMeta>,
     query_context: Option<String>,
+    /// Data-edit strip state (travels with the tab like the grid).
+    data_edit: Option<DataEditState>,
 }
 
 impl Tab {
@@ -84,6 +86,7 @@ impl Tab {
             last_row_count: 0,
             last_columns: Vec::new(),
             query_context: None,
+            data_edit: None,
         }
     }
 }
@@ -137,6 +140,11 @@ struct App {
     objects: Option<ObjectsState>,
     /// Last left-click on a navigator row, for time-based double click.
     tree_last_click: Option<(TreeClickTarget, std::time::Instant)>,
+    /// Data-grid edit overlay (single-table results with a primary key).
+    data_edit: Option<DataEditState>,
+    /// Object + SQL of the generated SELECT currently running; consumed
+    /// when its rows land (`apply_result`) to open the edit strip.
+    data_pending: Option<(ObjectRef, String)>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -288,6 +296,33 @@ enum Message {
     ObjectsRowClick(usize),
     /// Toolbar actions of the objects panel.
     ObjectsAction(ObjectsAction),
+    // ── data grid editing (single-table results with a primary key) ────
+    /// Draft a cell of the selected row: (row, col, text).
+    DataField(usize, usize, String),
+    /// Toggle the NULL flag of a cell of the selected row.
+    DataFieldNull(usize, usize, bool),
+    /// Draft a column of the pending insert row.
+    DataInsertField(usize, String),
+    /// Toggle the NULL flag of a column of the pending insert row.
+    DataInsertFieldNull(usize, bool),
+    /// Start composing a new row ("Insertar fila").
+    DataStartInsert,
+    /// Arm the two-step mark-for-deletion of the selected row.
+    DataDeleteAsk,
+    /// Mark the selected row for deletion (applied on "Aplicar").
+    DataDeleteConfirm,
+    /// Leave the deletion confirmation step.
+    DataDeleteCancel,
+    /// Apply all pending edits (UPDATE/INSERT/DELETE) and refresh.
+    DataApply,
+    /// Discard every pending change (drafts, insert, deletions).
+    DataCancel,
+    /// Close the data-edit strip entirely (grid stays read-only).
+    DataClose,
+    /// `edit_statements` batch finished; refresh the grid on success.
+    DataApplied(ObjectRef, Result<usize, String>),
+    /// `describe_table` answered for the data-edit strip (primary keys).
+    DataDescribed(ObjectRef, Result<drivers::TableDetail, String>),
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -368,6 +403,106 @@ struct ObjectsState {
 enum TreeClickTarget {
     Conn(ConnectionId),
     Node(ObjectRef),
+}
+
+/// Draft of one editable form field: the text as typed plus its NULL flag.
+/// Compared against the original cell to detect dirty state.
+#[derive(Clone, PartialEq, Debug)]
+struct FieldDraft {
+    text: String,
+    null: bool,
+}
+
+impl FieldDraft {
+    fn from_cell(cell: &CellValue) -> Self {
+        match cell {
+            CellValue::Null => Self {
+                text: String::new(),
+                null: true,
+            },
+            other => Self {
+                text: other.as_display().into_owned(),
+                null: false,
+            },
+        }
+    }
+
+    fn matches_cell(&self, cell: &CellValue) -> bool {
+        &Self::from_cell(cell) == self
+    }
+}
+
+/// Data-edit overlay for the result grid: active when the displayed rows
+/// came from a generated single-table `SELECT` whose table has a primary
+/// key (Navicat-style row editing in a strip above the grid).
+struct DataEditState {
+    /// Source table the SELECT was generated from.
+    source: ObjectRef,
+    /// Connection owning the table (session for apply/refresh).
+    connection: ConnectionId,
+    /// The generated SELECT; re-run after every successful apply.
+    sql: String,
+    /// Primary key column names (state is dropped when empty).
+    pk: Vec<String>,
+    /// `describe_table` still in flight (strip shows a waiting state).
+    loading_pk: bool,
+    /// Result columns: labels and type families for literals.
+    columns: Vec<ColumnMeta>,
+    /// Original rows as fetched (PK values and draft comparison).
+    rows: Vec<Vec<CellValue>>,
+    /// Row selected in the grid (index into `rows`).
+    selected: Option<usize>,
+    /// Pending new row: column → draft (shows the insert form instead).
+    insert: Option<HashMap<usize, FieldDraft>>,
+    /// Two-step mark-for-deletion confirmation showing.
+    confirm_delete: bool,
+    /// Pending cell edits: (row, col) → draft.
+    drafts: HashMap<(usize, usize), FieldDraft>,
+    /// Rows pending deletion (indexes into `rows`).
+    deletes: HashSet<usize>,
+}
+
+impl DataEditState {
+    /// Draft for a cell of the selected row, defaulting to the original.
+    fn draft(&self, row: usize, col: usize) -> FieldDraft {
+        self.drafts
+            .get(&(row, col))
+            .cloned()
+            .or_else(|| {
+                self.rows.get(row).and_then(|r| r.get(col)).map(FieldDraft::from_cell)
+            })
+            .unwrap_or(FieldDraft {
+                text: String::new(),
+                null: false,
+            })
+    }
+
+    /// Draft for an insert-form column (blank until typed).
+    fn insert_draft(&self, col: usize) -> FieldDraft {
+        self.insert
+            .as_ref()
+            .and_then(|m| m.get(&col))
+            .cloned()
+            .unwrap_or(FieldDraft {
+                text: String::new(),
+                null: false,
+            })
+    }
+
+    /// Pending operations: dirty cells + pending insert + marked deletions.
+    fn pending_count(&self) -> usize {
+        let dirty = self
+            .drafts
+            .iter()
+            .filter(|((row, col), draft)| {
+                self.rows
+                    .get(*row)
+                    .and_then(|r| r.get(*col))
+                    .is_some_and(|orig| !draft.matches_cell(orig))
+            })
+            .count();
+        dirty + usize::from(self.insert.is_some()) + self.deletes.len()
+    }
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
@@ -543,6 +678,8 @@ fn boot() -> (App, Task<Message>) {
             context_menu: None,
             objects: None,
             tree_last_click: None,
+            data_edit: None,
+            data_pending: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -798,6 +935,59 @@ fn design_describe_task(
     )
 }
 
+/// Describe the data-edit strip's table to learn its primary keys.
+fn data_describe_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    table: ObjectRef,
+) -> Task<Message> {
+    let reply = table.clone();
+    Task::perform(
+        async move {
+            let res: Result<_, String> = rt
+                .spawn(async move {
+                    client
+                        .describe_table(&table)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            res
+        },
+        move |res| Message::DataDescribed(reply.clone(), res),
+    )
+}
+
+/// Run the data-edit DML batch sequentially (same semantics as
+/// `design_apply_task`); `DataApplied` carries the source table so a
+/// late reply for a stale strip can be ignored.
+fn data_apply_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    stmts: Vec<String>,
+    source: ObjectRef,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let mut applied = 0usize;
+                for stmt in stmts {
+                    client
+                        .execute(ExecuteRequest::new(&stmt))
+                        .await
+                        .map_err(|e| format!("{stmt}\n  → {e}"))?;
+                    applied += 1;
+                }
+                Ok::<usize, String>(applied)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        move |res| Message::DataApplied(source.clone(), res),
+    )
+}
+
 /// Run the designer's DDL statements sequentially; `Ok(n)` counts the ones
 /// that completed before any failure stopped the batch.
 fn design_apply_task(
@@ -1018,7 +1208,21 @@ impl App {
                     }
                 }
             }
-            Message::Grid(msg) => self.grid.update(msg).map(Message::Grid),
+            Message::Grid(msg) => {
+                // A row click arms the data-edit form: the grid owns the
+                // selection (identity-keyed), so read it after forwarding.
+                let pressed = matches!(&msg, grid::GridEvent::RowPressed { .. });
+                let task = self.grid.update(msg).map(Message::Grid);
+                if pressed && self.data_edit.is_some() {
+                    let sel = self.grid.selection().iter().next().copied();
+                    if let Some(edit) = &mut self.data_edit {
+                        edit.selected = sel.map(|id| id as usize);
+                        edit.insert = None;
+                        edit.confirm_delete = false;
+                    }
+                }
+                task
+            }
             Message::SearchInput(text) => {
                 self.search_text = text;
                 self.refresh_search();
@@ -1466,6 +1670,213 @@ impl App {
                     }
                 }
             }
+            // ── data grid editing: drafts, insert, delete, apply ─────────
+            Message::DataField(row, col, text) => {
+                if let Some(edit) = &mut self.data_edit {
+                    if edit.insert.is_none() && edit.selected == Some(row) {
+                        let draft = FieldDraft { text, null: false };
+                        match edit.rows.get(row).and_then(|r| r.get(col)) {
+                            Some(orig) if draft.matches_cell(orig) => {
+                                // Typed back to the original: not dirty.
+                                edit.drafts.remove(&(row, col));
+                            }
+                            Some(_) => {
+                                edit.drafts.insert((row, col), draft);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::DataFieldNull(row, col, null) => {
+                if let Some(edit) = &mut self.data_edit {
+                    if edit.insert.is_none() && edit.selected == Some(row) {
+                        let mut draft = edit.draft(row, col);
+                        draft.null = null;
+                        match edit.rows.get(row).and_then(|r| r.get(col)) {
+                            Some(orig) if draft.matches_cell(orig) => {
+                                edit.drafts.remove(&(row, col));
+                            }
+                            Some(_) => {
+                                edit.drafts.insert((row, col), draft);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::DataInsertField(col, text) => {
+                if let Some(edit) = &mut self.data_edit {
+                    if edit.insert.is_some() {
+                        edit.insert
+                            .get_or_insert_with(HashMap::new)
+                            .insert(col, FieldDraft { text, null: false });
+                    }
+                }
+                Task::none()
+            }
+            Message::DataInsertFieldNull(col, null) => {
+                if let Some(edit) = &mut self.data_edit {
+                    if let Some(map) = &mut edit.insert {
+                        let draft = map
+                            .entry(col)
+                            .or_insert(FieldDraft {
+                                text: String::new(),
+                                null: false,
+                            });
+                        draft.null = null;
+                    }
+                }
+                Task::none()
+            }
+            Message::DataStartInsert => {
+                if let Some(edit) = &mut self.data_edit {
+                    if !edit.loading_pk {
+                        edit.insert.get_or_insert_with(HashMap::new);
+                        edit.confirm_delete = false;
+                    }
+                }
+                Task::none()
+            }
+            Message::DataDeleteAsk => {
+                if let Some(edit) = &mut self.data_edit {
+                    if !edit.loading_pk && edit.insert.is_none() && edit.selected.is_some() {
+                        edit.confirm_delete = true;
+                    }
+                }
+                Task::none()
+            }
+            Message::DataDeleteConfirm => {
+                if let Some(edit) = &mut self.data_edit {
+                    if let Some(row) = edit.selected.take() {
+                        edit.deletes.insert(row);
+                        // The row is going away: drop its drafts too.
+                        edit.drafts.retain(|(r, _), _| *r != row);
+                    }
+                    edit.confirm_delete = false;
+                }
+                Task::none()
+            }
+            Message::DataDeleteCancel => {
+                if let Some(edit) = &mut self.data_edit {
+                    edit.confirm_delete = false;
+                }
+                Task::none()
+            }
+            Message::DataApply => {
+                let Some(edit) = &self.data_edit else {
+                    return Task::none();
+                };
+                if edit.loading_pk {
+                    return Task::none();
+                }
+                let engine = self.engine_of(edit.connection);
+                let stmts = edit_statements(engine, edit);
+                if stmts.is_empty() {
+                    self.status = "sin cambios pendientes".to_string();
+                    return Task::none();
+                }
+                let source = edit.source.clone();
+                let Some(session) = self.sessions.get(&edit.connection) else {
+                    self.status = "sin sesión: no se puede aplicar".to_string();
+                    return Task::none();
+                };
+                let client = session.client.clone();
+                self.status = format!("aplicando {} sentencia(s)…", stmts.len());
+                data_apply_task(self.rt.clone(), client, stmts, source)
+            }
+            Message::DataApplied(source, res) => match res {
+                Ok(applied) => {
+                    let refresh = self
+                        .data_edit
+                        .as_ref()
+                        .filter(|e| e.source == source)
+                        .map(|e| e.sql.clone());
+                    match refresh {
+                        Some(sql) => {
+                            self.status =
+                                format!("✓ {applied} sentencia(s) aplicadas — refrescando…");
+                            self.data_pending = Some((source, sql.clone()));
+                            match self
+                                .data_edit
+                                .as_ref()
+                                .and_then(|e| self.sessions.get(&e.connection))
+                            {
+                                Some(session) => {
+                                    let client = session.client.clone();
+                                    let req =
+                                        ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
+                                    execute_task(self.rt.clone(), client, req, self.active_tab)
+                                }
+                                None => {
+                                    self.data_edit = None;
+                                    Task::none()
+                                }
+                            }
+                        }
+                        None => {
+                            self.status = format!("✓ {applied} sentencia(s) aplicadas");
+                            Task::none()
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("error aplicando: {e}");
+                    Task::none()
+                }
+            },
+            Message::DataDescribed(table, res) => {
+                let owns = self.data_edit.as_ref().is_some_and(|e| e.source == table);
+                if !owns {
+                    return Task::none();
+                }
+                match res {
+                    Ok(detail) => {
+                        let binary_pk = detail.primary_keys.iter().any(|name| {
+                            detail
+                                .columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(name))
+                                .is_some_and(|c| c.data_type.family == TypeFamily::Bytes)
+                        });
+                        if detail.primary_keys.is_empty() {
+                            self.data_edit = None;
+                            self.status =
+                                "tabla sin clave primaria: edición no disponible".to_string();
+                        } else if binary_pk {
+                            self.data_edit = None;
+                            self.status =
+                                "clave primaria binaria: edición no disponible".to_string();
+                        } else if let Some(edit) = &mut self.data_edit {
+                            edit.pk = detail.primary_keys;
+                            edit.loading_pk = false;
+                            self.status =
+                                "edición de datos activa: selecciona una fila".to_string();
+                        }
+                    }
+                    Err(e) => {
+                        self.data_edit = None;
+                        self.status = format!("no se pudo leer la clave primaria: {e}");
+                    }
+                }
+                Task::none()
+            }
+            Message::DataCancel => {
+                if let Some(edit) = &mut self.data_edit {
+                    edit.drafts.clear();
+                    edit.insert = None;
+                    edit.deletes.clear();
+                    edit.confirm_delete = false;
+                }
+                self.status = "cambios descartados".to_string();
+                Task::none()
+            }
+            Message::DataClose => {
+                self.data_edit = None;
+                Task::none()
+            }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -1484,6 +1895,10 @@ impl App {
                 }
                 if self.objects.as_ref().is_some_and(|o| o.container.connection == removed.cfg.id) {
                     self.objects = None;
+                }
+                if self.data_edit.as_ref().is_some_and(|e| e.connection == removed.cfg.id) {
+                    self.data_edit = None;
+                    self.data_pending = None;
                 }
                 if self.design_pending == Some(removed.cfg.id) {
                     self.design_pending = None;
@@ -1543,6 +1958,17 @@ impl App {
                     self.status = "el editor está vacío".to_string();
                     return Task::none();
                 }
+                // Data editing arms only for the exact SELECT generated for
+                // a table (a hand-edited SQL stays read-only).
+                let data_obj = match self.selected_object.as_ref() {
+                    Some((obj, ObjectKind::Table))
+                        if self.query_for(obj, ObjectKind::Table) == sql =>
+                    {
+                        Some((obj.clone(), sql.clone()))
+                    }
+                    _ => None,
+                };
+                self.data_pending = data_obj;
                 let client = session.client.clone();
                 self.status = "ejecutando…".to_string();
                 let mut req = ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
@@ -1809,6 +2235,7 @@ impl App {
                 Ok(result) => self.apply_result(tab, result),
                 Err(e) => {
                     // Errors only surface on the tab that ran them.
+                    self.data_pending = None;
                     if tab == self.active_tab {
                         self.status = format!("error: {e}");
                     }
@@ -2387,6 +2814,9 @@ impl App {
         tab.last_row_count = self.last_row_count;
         tab.last_columns = std::mem::take(&mut self.last_columns);
         tab.query_context = self.query_context.clone();
+        tab.data_edit = self.data_edit.take();
+        // A pending data SELECT belongs to the tab that launched it.
+        self.data_pending = None;
     }
 
     /// Restore `tabs[index]` into the live fields and refill its grid.
@@ -2405,6 +2835,8 @@ impl App {
         self.query_context = tab.query_context.clone();
         let content = tab.content.clone();
         self.grid = std::mem::replace(&mut tab.grid, grid::empty());
+        self.data_edit = tab.data_edit.take();
+        self.data_pending = None;
         // Refill the restored grid with its last query (set_spec resets the
         // window and returns the initial fetch; `fetch_task` is private).
         let spec = self.grid.spec().clone();
@@ -2444,9 +2876,48 @@ impl App {
             self.status = status;
             self.last_columns = columns;
             self.last_row_count = row_count;
+            // Data-edit strip: install when this landing result is the
+            // armed generated SELECT (parked results stay read-only).
+            let armed = if result.is_rows() {
+                self.data_pending.take()
+            } else {
+                self.data_pending = None;
+                None
+            };
+            self.data_edit = None;
+            let edit_task = match armed {
+                Some((obj, sql)) => {
+                    let (edit_columns, edit_rows) =
+                        (result.columns.clone(), result.rows.clone());
+                    self.data_edit = Some(DataEditState {
+                        source: obj.clone(),
+                        connection: obj.connection,
+                        sql,
+                        pk: Vec::new(),
+                        loading_pk: true,
+                        columns: edit_columns,
+                        rows: edit_rows,
+                        selected: None,
+                        insert: None,
+                        confirm_delete: false,
+                        drafts: HashMap::new(),
+                        deletes: HashSet::new(),
+                    });
+                    match self.sessions.get(&obj.connection) {
+                        Some(session) => {
+                            data_describe_task(self.rt.clone(), session.client.clone(), obj)
+                        }
+                        None => {
+                            self.data_edit = None;
+                            Task::none()
+                        }
+                    }
+                }
+                None => Task::none(),
+            };
             let (grid, init) = grid::build(result);
             self.grid = grid;
-            init.map(Message::Grid)
+            Task::batch([init.map(Message::Grid), edit_task])
         } else if let Some(tab) = self.tabs.get_mut(tab_index) {
             let (grid, _init) = grid::build(result);
             tab.grid = grid;
@@ -2481,6 +2952,8 @@ impl App {
         self.sync = None;
         self.sync_pending = None;
         self.objects = None;
+        self.data_edit = None;
+        self.data_pending = None;
         self.completion.close();
         self.completion.dictionary = self
             .completion_words
@@ -3041,6 +3514,167 @@ impl App {
             .into()
     }
 
+    /// Data-edit strip between the result header and the grid: toolbar
+    /// (apply / insert / delete / cancel, or the two-step delete confirm)
+    /// plus a horizontal form over the selected row's fields. `None` when
+    /// no table edit is armed (the grid keeps its normal layout).
+    fn data_edit_view(&self) -> Option<Element<'_, Message>> {
+        let edit = self.data_edit.as_ref()?;
+        let table = edit
+            .source
+            .path
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "tabla".to_string());
+        let changes = edit.pending_count();
+        let ready = !edit.loading_pk;
+        let sel = edit.selected;
+        let inserting = edit.insert.is_some();
+
+        let hint = if edit.loading_pk {
+            "leyendo clave primaria…".to_string()
+        } else if inserting {
+            "fila nueva".to_string()
+        } else {
+            sel.map(|i| format!("fila #{i}"))
+                .unwrap_or_else(|| "selecciona una fila".to_string())
+        };
+
+        // ── toolbar: apply/insert/delete/cancel or delete confirmation ──
+        let actions: Element<'_, Message> = if edit.confirm_delete {
+            row![
+                text(format!(
+                    "¿Marcar para eliminar la fila #{}?",
+                    sel.unwrap_or(0)
+                ))
+                .size(12),
+                button(text("Sí, marcar").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::solid)
+                    .on_press(Message::DataDeleteConfirm),
+                button(text("Cancelar").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::flat)
+                    .on_press(Message::DataDeleteCancel),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            row![
+                button(text("Aplicar").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::solid)
+                    .on_press_maybe((ready && changes > 0).then_some(Message::DataApply)),
+                button(text("Insertar fila").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::flat)
+                    .on_press_maybe(ready.then_some(Message::DataStartInsert)),
+                button(text("Borrar fila").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::flat)
+                    .on_press_maybe(
+                        (ready && sel.is_some() && !inserting).then_some(Message::DataDeleteAsk),
+                    ),
+                button(text("Cancelar").size(12))
+                    .padding([3.0, 7.0])
+                    .style(theme::flat)
+                    .on_press_maybe((changes > 0).then_some(Message::DataCancel)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        let bar = container(
+            row![
+                text(format!("✎ {table}")).size(12),
+                text(hint).size(12).color(theme::muted()),
+                text(format!("{changes} cambio(s) pendiente(s)")).size(12),
+                container(actions)
+                    .width(Length::Fill)
+                    .align_x(iced::Alignment::End),
+                button(text("✕").size(11))
+                    .padding([3.0, 6.0])
+                    .style(theme::flat)
+                    .on_press(Message::DataClose),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([5.0, 8.0])
+        .style(theme::chrome);
+
+        // ── body: waiting / field form (insert row or selected row) ─────
+        let body: Element<'_, Message> = if edit.loading_pk {
+            text("leyendo claves primarias…")
+                .size(12)
+                .color(theme::muted())
+                .into()
+        } else {
+            let mut fields = row![].spacing(8).align_y(iced::Alignment::Start);
+            if inserting {
+                for (idx, meta) in edit.columns.iter().enumerate() {
+                    let draft = edit.insert_draft(idx);
+                    fields = fields.push(field_block(
+                        &meta.name,
+                        false,
+                        false,
+                        meta.data_type.family == TypeFamily::Bytes,
+                        draft,
+                        move |v| Message::DataInsertField(idx, v),
+                        move |v| Message::DataInsertFieldNull(idx, v),
+                    ));
+                }
+            } else if let Some(row_idx) = sel.filter(|r| *r < edit.rows.len()) {
+                let orig_row = &edit.rows[row_idx];
+                for (idx, meta) in edit.columns.iter().enumerate() {
+                    let draft = edit.draft(row_idx, idx);
+                    let dirty = orig_row
+                        .get(idx)
+                        .is_some_and(|orig| !draft.matches_cell(orig));
+                    let is_pk = edit
+                        .pk
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&meta.name));
+                    fields = fields.push(field_block(
+                        &meta.name,
+                        is_pk,
+                        dirty,
+                        meta.data_type.family == TypeFamily::Bytes,
+                        draft,
+                        move |v| Message::DataField(row_idx, idx, v),
+                        move |v| Message::DataFieldNull(row_idx, idx, v),
+                    ));
+                }
+            } else {
+                fields = fields.push(
+                    text("haz clic en una fila del grid para editarla")
+                        .size(12)
+                        .color(theme::muted()),
+                );
+            }
+            scrollable(fields)
+                .horizontal()
+                .height(Length::Fixed(96.0))
+                .into()
+        };
+
+        Some(
+            Column::new()
+                .push(bar)
+                .push(rule::horizontal(1).style(theme::hairline))
+                .push(
+                    container(body)
+                        .width(Length::Fill)
+                        .padding([6.0, 8.0])
+                        .style(theme::chrome),
+                )
+                .into(),
+        )
+    }
+
     fn view(&self) -> Element<'_, Message> {
         // ── custom title bar: brand + actions + window controls ─────────
         // Frameless window: the bar replaces the native title bar, so it is
@@ -3423,14 +4057,19 @@ impl App {
                 (None, Some(d), _, _) => self.designer_view(d),
                 (None, None, Some(er), _) => self.er_view(er),
                 (None, None, None, Some(o)) => self.objects_view(o),
-                (None, None, None, None) => Column::new()
-                    .push(editor_tabs)
-                    .push(editor.height(Length::FillPortion(2)))
-                    .push(rule::horizontal(1).style(theme::hairline))
-                    .push(result_strip)
-                    .push(grid.height(Length::FillPortion(3)))
-                    .width(Length::Fill)
-                    .into(),
+                (None, None, None, None) => {
+                    let mut col = Column::new()
+                        .push(editor_tabs)
+                        .push(editor.height(Length::FillPortion(2)))
+                        .push(rule::horizontal(1).style(theme::hairline))
+                        .push(result_strip);
+                    if let Some(strip) = self.data_edit_view() {
+                        col = col.push(strip);
+                    }
+                    col.push(grid.height(Length::FillPortion(3)))
+                        .width(Length::Fill)
+                        .into()
+                }
             };
 
         let main = row![navigator, center];
@@ -3590,9 +4229,27 @@ fn query_for_engine(engine: Engine, obj: &ObjectRef, kind: ObjectKind) -> String
         return format!("{{\n  \"find\": \"{esc}\",\n  \"filter\": {{}},\n  \"limit\": 100\n}}");
     }
 
-    let from = match engine {
+    let from = table_ref(engine, obj);
+
+    if engine == Engine::SqlServer {
+        format!("SELECT TOP 100 * FROM {from};")
+    } else {
+        format!("SELECT * FROM {from} LIMIT 100;")
+    }
+}
+
+/// Target name for DML against `obj`, qualified exactly like the generated
+/// SELECT is (SQLite is bare; MySQL `db.table`, Postgres `schema.table`,
+/// SQL Server `db..table` for two-segment paths). Shared by the data-edit
+/// UPDATE/INSERT/DELETE so DML can never diverge from the SELECT that
+/// filled the grid.
+fn table_ref(engine: Engine, obj: &ObjectRef) -> String {
+    match engine {
         // The first segment is the file's display label, not a schema.
-        Engine::Sqlite => quote_ident(last, engine),
+        Engine::Sqlite => quote_ident(
+            obj.path.last().map(String::as_str).unwrap_or(""),
+            engine,
+        ),
         // A session is bound to its database: the db segment would mean a
         // cross-database reference (rejected by PostgreSQL).
         Engine::Postgres | Engine::Oracle | Engine::Mongodb => obj
@@ -3622,12 +4279,6 @@ fn query_for_engine(engine: Engine, obj: &ObjectRef, kind: ObjectKind) -> String
             .map(|s| quote_ident(s, engine))
             .collect::<Vec<_>>()
             .join("."),
-    };
-
-    if engine == Engine::SqlServer {
-        format!("SELECT TOP 100 * FROM {from};")
-    } else {
-        format!("SELECT * FROM {from} LIMIT 100;")
     }
 }
 
@@ -3660,6 +4311,251 @@ fn drop_statement(engine: Engine, kind: ObjectKind, obj: &ObjectRef) -> Option<S
         }
     };
     Some(format!("{keyword} {full};"))
+}
+
+/// Single-quoted text literal escaped for the engine. MySQL also escapes
+/// backslashes (they are escape characters inside its strings); the other
+/// engines only double the quote.
+fn text_literal(engine: Engine, s: &str) -> String {
+    let escaped = if matches!(engine, Engine::Mysql | Engine::MariaDb) {
+        s.replace('\\', "\\\\").replace('\'', "''")
+    } else {
+        s.replace('\'', "''")
+    };
+    format!("'{escaped}'")
+}
+
+/// Boolean literal per dialect: Postgres spells TRUE/FALSE, the rest take 1/0.
+fn bool_literal(engine: Engine, b: bool) -> String {
+    match engine {
+        Engine::Postgres => (if b { "TRUE" } else { "FALSE" }).to_string(),
+        _ => (if b { "1" } else { "0" }).to_string(),
+    }
+}
+
+/// Literal for a drafted form field: NULL wins when the toggle is set;
+/// numeric families emit the raw number when it parses (plain, so no
+/// coercion through a string) and everything else is a quoted text literal.
+fn draft_literal(engine: Engine, family: TypeFamily, d: &FieldDraft) -> String {
+    if d.null {
+        return "NULL".to_string();
+    }
+    let t = d.text.trim();
+    match family {
+        TypeFamily::Int if t.parse::<i64>().is_ok() => t.to_string(),
+        TypeFamily::UInt if t.parse::<u64>().is_ok() => t.to_string(),
+        TypeFamily::Float | TypeFamily::Decimal if t.parse::<f64>().is_ok() => t.to_string(),
+        TypeFamily::Bool => {
+            let truthy = matches!(
+                t.to_ascii_lowercase().as_str(),
+                "true" | "1" | "t" | "yes" | "on"
+            );
+            bool_literal(engine, truthy)
+        }
+        _ => text_literal(engine, &d.text),
+    }
+}
+
+/// Literal for an ORIGINAL fetched cell value (already typed): used inside
+/// WHERE clauses so updates/deletes pin the row by its primary key as
+/// read from the server. Binary cells are unreachable (rejected at install)
+/// and fall back to their display text. `_family` documents the column the
+/// value came from; the value itself carries enough typing to literalize.
+fn cell_literal(engine: Engine, _family: TypeFamily, v: &CellValue) -> String {
+    match v {
+        CellValue::Null => "NULL".to_string(),
+        CellValue::Bool(b) => bool_literal(engine, *b),
+        CellValue::Int(i) => i.to_string(),
+        CellValue::UInt(u) => u.to_string(),
+        CellValue::Float(f) => f.to_string(),
+        CellValue::Text(s) => text_literal(engine, s),
+        CellValue::DateTime(dt) => text_literal(engine, &dt.to_rfc3339()),
+        CellValue::Json(j) => text_literal(engine, &j.to_string()),
+        CellValue::Other { value, .. } => text_literal(engine, value),
+        CellValue::Bytes(_) => text_literal(engine, &v.as_display()),
+    }
+}
+
+/// Index of a result column by name, case-insensitively (PK names come from
+/// the catalog while column names come from the result set).
+fn col_index(columns: &[ColumnMeta], name: &str) -> Option<usize> {
+    columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// DML for a data-edit strip: one UPDATE per dirty row (SET only the dirty
+/// columns, WHERE pins the ORIGINAL primary-key values), one INSERT per
+/// pending new row (blank columns omitted so the engine applies
+/// defaults/NULL) and one DELETE per marked row. Rows already marked for
+/// deletion skip their UPDATEs. Returns `[]` when there is nothing to do.
+fn edit_statements(engine: Engine, edit: &DataEditState) -> Vec<String> {
+    let from = table_ref(engine, &edit.source);
+    let pk_idx: Vec<usize> = edit
+        .pk
+        .iter()
+        .filter_map(|name| col_index(&edit.columns, name))
+        .collect();
+    let pk_ok = pk_idx.len() == edit.pk.len() && !pk_idx.is_empty();
+    let mut out = Vec::new();
+
+    // ── UPDATEs (grouped by row, columns in stable index order) ────────
+    if pk_ok {
+        let mut by_row: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for &(row, col) in edit.drafts.keys() {
+            by_row.entry(row).or_default().push(col);
+        }
+        for (row, mut cols) in by_row {
+            if edit.deletes.contains(&row) || row >= edit.rows.len() {
+                continue;
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            let orig = &edit.rows[row];
+            let sets: Vec<String> = cols
+                .into_iter()
+                .filter_map(|col| {
+                    let d = edit.drafts.get(&(row, col))?;
+                    let meta = edit.columns.get(col)?;
+                    let cell = orig.get(col)?;
+                    if d.matches_cell(cell) {
+                        return None;
+                    }
+                    Some(format!(
+                        "{} = {}",
+                        quote_ident(&meta.name, engine),
+                        draft_literal(engine, meta.data_type.family, d)
+                    ))
+                })
+                .collect();
+            if sets.is_empty() {
+                continue;
+            }
+            let wheres: Vec<String> = pk_idx
+                .iter()
+                .map(|&i| {
+                    let meta = &edit.columns[i];
+                    format!(
+                        "{} = {}",
+                        quote_ident(&meta.name, engine),
+                        cell_literal(engine, meta.data_type.family, &orig[i])
+                    )
+                })
+                .collect();
+            out.push(format!(
+                "UPDATE {from} SET {} WHERE {};",
+                sets.join(", "),
+                wheres.join(" AND ")
+            ));
+        }
+    }
+
+    // ── INSERTs (only columns with a filled draft) ─────────────────────
+    for ins in edit.insert.iter() {
+        let mut names = Vec::new();
+        let mut values = Vec::new();
+        for (idx, meta) in edit.columns.iter().enumerate() {
+            let Some(d) = ins.get(&idx) else {
+                continue;
+            };
+            if !(d.null || !d.text.trim().is_empty()) {
+                continue;
+            }
+            names.push(quote_ident(&meta.name, engine));
+            values.push(draft_literal(engine, meta.data_type.family, d));
+        }
+        if names.is_empty() {
+            out.push(if matches!(engine, Engine::Mysql | Engine::MariaDb) {
+                format!("INSERT INTO {from} () VALUES ();")
+            } else {
+                format!("INSERT INTO {from} DEFAULT VALUES;")
+            });
+        } else {
+            out.push(format!(
+                "INSERT INTO {from} ({}) VALUES ({});",
+                names.join(", "),
+                values.join(", ")
+            ));
+        }
+    }
+
+    // ── DELETEs (marked rows, stable order) ────────────────────────────
+    if pk_ok {
+        let mut rows: Vec<usize> = edit.deletes.iter().copied().collect();
+        rows.sort_unstable();
+        for row in rows {
+            if row >= edit.rows.len() {
+                continue;
+            }
+            let orig = &edit.rows[row];
+            let wheres: Vec<String> = pk_idx
+                .iter()
+                .map(|&i| {
+                    let meta = &edit.columns[i];
+                    format!(
+                        "{} = {}",
+                        quote_ident(&meta.name, engine),
+                        cell_literal(engine, meta.data_type.family, &orig[i])
+                    )
+                })
+                .collect();
+            out.push(format!(
+                "DELETE FROM {from} WHERE {};",
+                wheres.join(" AND ")
+            ));
+        }
+    }
+
+    out
+}
+
+/// One labeled field of the data-edit form: name (+PK dot, dirty bullet)
+/// over a value input and a NULL toggle. `disabled` locks blobs (they
+/// cannot round-trip through the text form).
+fn field_block<F, G>(
+    name: &str,
+    pk: bool,
+    dirty: bool,
+    disabled: bool,
+    draft: FieldDraft,
+    on_input: F,
+    on_null: G,
+) -> Element<'static, Message>
+where
+    F: Fn(String) -> Message + 'static,
+    G: Fn(bool) -> Message + 'static,
+{
+    let mut label = if pk {
+        format!("{name} ● PK")
+    } else {
+        name.to_string()
+    };
+    if dirty {
+        label = format!("• {label}");
+    }
+    let mut input = text_input(if disabled { "blob (solo lectura)" } else { "valor" }, &draft.text)
+        .size(12)
+        .padding([4.0, 6.0])
+        .width(Length::Fixed(160.0));
+    let mut toggle = checkbox(draft.null).size(13);
+    if !disabled {
+        input = input.on_input(on_input);
+        toggle = toggle.on_toggle(on_null);
+    }
+    container(
+        Column::new()
+            .push(text(label).size(10).color(theme::muted()))
+            .push(
+                row![input, toggle, text("NULL").size(10).color(theme::muted())]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+            )
+            .spacing(2),
+    )
+    .padding([4.0, 6.0])
+    .style(theme::workspace)
+    .into()
 }
 
 /// Toolbar button in the Navicat style: big icon above a small caption.
@@ -4536,6 +5432,271 @@ mod tests {
             &0,
             t0 + Duration::from_millis(401)
         ));
+    }
+
+    // ── m16: data grid editing ───────────────────────────────────────────
+
+    /// ColumnMeta shortcut for the data-edit tests.
+    fn dcol(name: &str, family: TypeFamily) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            data_type: dbstudio_core::DataType::new(name, family),
+            nullable: true,
+            comment: None,
+        }
+    }
+
+    /// Ready-to-edit state over `demo.db.pedidos` with two fetched rows.
+    fn edit_fixture() -> DataEditState {
+        DataEditState {
+            source: obj(&["demo.db", "pedidos"]),
+            connection: ConnectionId::nil(),
+            sql: "SELECT * FROM \"pedidos\" LIMIT 100;".into(),
+            pk: vec!["id".into()],
+            loading_pk: false,
+            columns: vec![
+                dcol("id", TypeFamily::Int),
+                dcol("total", TypeFamily::Float),
+                dcol("estado", TypeFamily::Text),
+            ],
+            rows: vec![
+                vec![
+                    CellValue::Int(7),
+                    CellValue::Float(9.5),
+                    CellValue::Text("ok".into()),
+                ],
+                vec![
+                    CellValue::Int(8),
+                    CellValue::Float(1.0),
+                    CellValue::Text("pend".into()),
+                ],
+            ],
+            selected: Some(0),
+            insert: None,
+            confirm_delete: false,
+            drafts: HashMap::new(),
+            deletes: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn text_literal_escapes_per_engine() {
+        // MySQL treats backslash as an escape char: it must be doubled too.
+        assert_eq!(
+            text_literal(Engine::Mysql, "a\\b'c"),
+            "'a\\\\b''c'".to_string()
+        );
+        // Other engines only double the quote.
+        assert_eq!(
+            text_literal(Engine::Postgres, "a\\b'c"),
+            "'a\\b''c'".to_string()
+        );
+        assert_eq!(
+            text_literal(Engine::Sqlite, "o'neil"),
+            "'o''neil'".to_string()
+        );
+    }
+
+    #[test]
+    fn draft_literal_toggles_null_and_numbers() {
+        // NULL toggle wins over typed text.
+        assert_eq!(
+            draft_literal(
+                Engine::Postgres,
+                TypeFamily::Text,
+                &FieldDraft {
+                    text: "x".into(),
+                    null: true
+                }
+            ),
+            "NULL"
+        );
+        // Numeric families stay unquoted when they parse.
+        assert_eq!(
+            draft_literal(
+                Engine::Postgres,
+                TypeFamily::Int,
+                &FieldDraft {
+                    text: "42".into(),
+                    null: false
+                }
+            ),
+            "42"
+        );
+        // Unparseable numeric falls back to a quoted literal.
+        assert_eq!(
+            draft_literal(
+                Engine::Mysql,
+                TypeFamily::Float,
+                &FieldDraft {
+                    text: "abc".into(),
+                    null: false
+                }
+            ),
+            "'abc'"
+        );
+        // Booleans: TRUE/FALSE on Postgres, 1/0 elsewhere.
+        let yes = FieldDraft {
+            text: "true".into(),
+            null: false,
+        };
+        assert_eq!(draft_literal(Engine::Postgres, TypeFamily::Bool, &yes), "TRUE");
+        assert_eq!(draft_literal(Engine::Mysql, TypeFamily::Bool, &yes), "1");
+        let no = FieldDraft {
+            text: "0".into(),
+            null: false,
+        };
+        assert_eq!(draft_literal(Engine::Postgres, TypeFamily::Bool, &no), "FALSE");
+    }
+
+    #[test]
+    fn field_draft_roundtrip_and_dirty_detection() {
+        // Text cell → draft → typed-over → dirty; typed back → clean.
+        let cell = CellValue::Text("pagada".into());
+        assert!(FieldDraft::from_cell(&cell).matches_cell(&cell));
+        let typed = FieldDraft {
+            text: "fallida".into(),
+            null: false,
+        };
+        assert!(!typed.matches_cell(&cell));
+        assert!(typed.matches_cell(&CellValue::Text("fallida".into())));
+        // NULL cell roundtrips through the toggle, not the text.
+        let nul = FieldDraft::from_cell(&CellValue::Null);
+        assert!(nul.null);
+        assert!(nul.matches_cell(&CellValue::Null));
+        assert!(!FieldDraft {
+            text: String::new(),
+            null: false
+        }
+        .matches_cell(&CellValue::Null));
+    }
+
+    #[test]
+    fn edit_statements_update_sets_dirty_columns_only_with_original_pk() {
+        let mut e = edit_fixture();
+        // Dirty estado on row 0; total typed back to its original → clean.
+        e.drafts.insert(
+            (0, 2),
+            FieldDraft {
+                text: "pagada".into(),
+                null: false,
+            },
+        );
+        e.drafts.insert(
+            (0, 1),
+            FieldDraft {
+                text: "9.5".into(),
+                null: false,
+            },
+        );
+        let stmts = edit_statements(Engine::Sqlite, &e);
+        assert_eq!(
+            stmts,
+            vec![
+                "UPDATE \"pedidos\" SET \"estado\" = 'pagada' WHERE \"id\" = 7;".to_string()
+            ]
+        );
+
+        // PK clause uses the ORIGINAL value even when the PK itself is edited.
+        e.drafts.insert(
+            (1, 0),
+            FieldDraft {
+                text: "99".into(),
+                null: false,
+            },
+        );
+        e.selected = Some(1);
+        let stmts = edit_statements(Engine::Postgres, &e);
+        assert!(stmts.iter().any(|s| s
+            == "UPDATE \"pedidos\" SET \"id\" = 99 WHERE \"id\" = 8;"));
+
+        // Rows marked for deletion skip their UPDATEs.
+        e.deletes.insert(1);
+        let stmts = edit_statements(Engine::Postgres, &e);
+        assert!(!stmts.iter().any(|s| s.contains("\"id\" = 99")));
+    }
+
+    #[test]
+    fn edit_statements_insert_omits_blank_columns_and_defaults() {
+        let mut e = edit_fixture();
+        // No insert form → no INSERT.
+        assert!(edit_statements(Engine::Sqlite, &e).is_empty());
+
+        // Form open but every column blank → DEFAULT VALUES.
+        e.insert = Some(HashMap::new());
+        let stmts = edit_statements(Engine::Sqlite, &e);
+        assert_eq!(
+            stmts,
+            vec!["INSERT INTO \"pedidos\" DEFAULT VALUES;".to_string()]
+        );
+        // MySQL spells the empty row differently (path = [db, table]).
+        e.source = obj(&["demo", "pedidos"]);
+        assert_eq!(
+            edit_statements(Engine::Mysql, &e),
+            vec!["INSERT INTO `demo`.`pedidos` () VALUES ();".to_string()]
+        );
+        e.source = obj(&["demo.db", "pedidos"]);
+
+        // One filled column → only that column appears.
+        let mut ins = HashMap::new();
+        ins.insert(
+            2,
+            FieldDraft {
+                text: "nueva".into(),
+                null: false,
+            },
+        );
+        ins.insert(
+            1,
+            FieldDraft {
+                text: "   ".into(),
+                null: false,
+            },
+        );
+        e.insert = Some(ins);
+        let stmts = edit_statements(Engine::Sqlite, &e);
+        assert_eq!(
+            stmts,
+            vec![
+                "INSERT INTO \"pedidos\" (\"estado\") VALUES ('nueva');".to_string()
+            ]
+        );
+
+        // NULL toggle counts as filled and emits NULL.
+        let mut ins = HashMap::new();
+        ins.insert(
+            1,
+            FieldDraft {
+                text: String::new(),
+                null: true,
+            },
+        );
+        e.insert = Some(ins);
+        let stmts = edit_statements(Engine::Postgres, &e);
+        assert_eq!(
+            stmts,
+            vec![
+                "INSERT INTO \"pedidos\" (\"total\") VALUES (NULL);".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_statements_delete_by_pk_in_stable_order() {
+        let mut e = edit_fixture();
+        e.deletes.insert(1);
+        e.deletes.insert(0);
+        let stmts = edit_statements(Engine::Sqlite, &e);
+        assert_eq!(
+            stmts,
+            vec![
+                "DELETE FROM \"pedidos\" WHERE \"id\" = 7;".to_string(),
+                "DELETE FROM \"pedidos\" WHERE \"id\" = 8;".to_string(),
+            ]
+        );
+        // A table without a resolvable PK yields nothing (install-time guard).
+        e.pk = vec!["no_existe".into()];
+        assert!(edit_statements(Engine::Sqlite, &e).is_empty());
     }
 }
 
