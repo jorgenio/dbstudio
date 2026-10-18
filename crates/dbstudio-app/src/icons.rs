@@ -40,10 +40,11 @@ pub enum Icon {
     Add,
     Open,
     Close,
+    Copy,
 }
 
 impl Icon {
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 27;
 
     pub fn index(self) -> usize {
         self as usize
@@ -78,6 +79,7 @@ impl Icon {
             23 => Add,
             24 => Open,
             25 => Close,
+            26 => Copy,
             _ => return None,
         })
     }
@@ -112,6 +114,7 @@ impl Icon {
             Add => "#3fb96a",
             Open => "#5b8def",
             Close => "#e5534b",
+            Copy => "#8a94a6",
         }
     }
 
@@ -283,6 +286,10 @@ fn build(icon: Icon) -> String {
         ),
         Close => format!(
             r##"<path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"##
+        ),
+        Copy => format!(
+            r##"<rect x="5.6" y="5.6" width="8.4" height="8.4" rx="1.6" fill="none" stroke="{c}" stroke-width="1.5"/>
+<path d="M10.4 3.6H3.6a1 1 0 0 0-1 1v6.8" fill="none" stroke="{c}" stroke-width="1.5" stroke-linecap="round"/>"##
         ),
     };
     format!(

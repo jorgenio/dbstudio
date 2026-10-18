@@ -26,7 +26,10 @@ use dbstudio_core::{
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
 use store::Connections;
-use iced::widget::{button, column, container, row, rule, scrollable, stack, text, Column, MouseArea, Space};
+use iced::widget::{
+    button, column, container, row, rule, scrollable, stack, text, text_input, Column, MouseArea,
+    Space,
+};
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
 use iced_code_editor::{CodeEditor, Message as EditorMessage};
@@ -123,6 +126,13 @@ struct App {
     /// flight (stale batches are discarded by matching this).
     sync: Option<SyncState>,
     sync_pending: Option<ConnectionId>,
+    /// Navigator filter: narrows the tree to labels containing this text.
+    tree_filter: String,
+    /// "Mis conexiones" root row expanded (its own toggle, kept out of
+    /// `expanded` because it is not an `ObjectRef`).
+    expanded_root: bool,
+    /// Right-click menu over a navigator row (connection or object node).
+    context_menu: Option<ContextMenu>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -175,6 +185,13 @@ enum Message {
     TreeToggle(ObjectRef, ObjectKind),
     /// Select a leaf node without loading children (columns and friends).
     TreeSelect(ObjectRef, ObjectKind),
+    /// Connection row inside the unified tree: select + expand (or
+    /// collapse when it is the active, already-expanded one).
+    TreeToggleConn(ConnectionId),
+    /// Toggle the synthetic "Mis connections" root row.
+    TreeRootToggle,
+    /// Navigator filter box.
+    TreeFilter(String),
     /// Table/view/collection clicked: put a starter query in the editor and
     /// expand the node's children.
     TreeOpenObject(ObjectRef, ObjectKind),
@@ -247,6 +264,52 @@ enum Message {
     EditSelected,
     /// The background test finished; Ok carries a short success blurb.
     Tested(Result<String, String>),
+    /// Right-click on a navigator row: open its context menu.
+    ContextOpen(MenuTarget),
+    /// Close the context menu (Esc, ✕ or a plain click in the tree).
+    ContextClose,
+    /// Context menu choice; `ConfirmDelete` only runs after the menu's
+    /// second, destructive step.
+    ContextAct(ContextAct),
+    /// `DROP TABLE/VIEW` finished for `ObjectRef` (Ok) or failed (Err).
+    ObjectDropped(ObjectRef, Result<(), String>),
+}
+
+/// Right-click menu shown right under a navigator row.
+struct ContextMenu {
+    target: MenuTarget,
+    /// Second step of "Eliminar…": destructive confirmation is showing.
+    confirm: bool,
+}
+
+/// What a context menu points at.
+#[derive(Clone, Debug)]
+enum MenuTarget {
+    Conn(ConnectionId),
+    Node(ObjectRef, ObjectKind),
+}
+
+/// Entries of the navigator context menu.
+#[derive(Clone, Copy, Debug)]
+enum ContextAct {
+    /// Put a starter query in the editor (table/view/collection).
+    Open,
+    /// Open the table designer for a table.
+    Design,
+    /// New table under a database/schema (or from a connection row).
+    NewTable,
+    /// Force a fresh children listing (connection root or node).
+    Refresh,
+    /// Copy the row's name to the clipboard.
+    CopyName,
+    /// Open the connection form for this connection.
+    EditConn,
+    /// Show the destructive confirmation step.
+    AskDelete,
+    /// Run DROP (object) or remove the connection.
+    ConfirmDelete,
+    /// Leave the confirmation step (closes the menu).
+    Cancel,
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
@@ -417,6 +480,9 @@ fn boot() -> (App, Task<Message>) {
             design_pending: None,
             sync: None,
             sync_pending: None,
+            tree_filter: String::new(),
+            expanded_root: true,
+            context_menu: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -531,6 +597,25 @@ fn is_under(target: &ObjectRef, k: &ObjectRef) -> bool {
         && k.path[..target.path.len()] == target.path[..]
 }
 
+/// Navigator filter: does this label pass? Empty filters pass everything.
+/// Matching is a case-insensitive substring test (as in Navicat's tree
+/// search box).
+fn node_matches(label: &str, filter: &str) -> bool {
+    let f = filter.trim();
+    f.is_empty() || label.to_lowercase().contains(&f.to_lowercase())
+}
+
+/// True when any *loaded* descendant of `node` matches the filter (so the
+/// tree can keep the branch visible without forcing lazy loads).
+fn subtree_matches(app: &App, node: &ObjectRef, filter: &str) -> bool {
+    let Some(children) = app.tree.get(node) else {
+        return false;
+    };
+    children.iter().any(|c| {
+        node_matches(&c.label, filter) || subtree_matches(app, &c.object, filter)
+    })
+}
+
 /// Container a new table would live in, derived from the last object the
 /// user opened: its database/schema, its parent (for tables), or the
 /// connection root when nothing is selected.
@@ -628,6 +713,30 @@ fn design_apply_task(
             .map_err(|e| e.to_string())?
         },
         Message::DesignApplied,
+    )
+}
+
+/// Run a single `DROP TABLE/VIEW` for the right-click "Eliminar…" action;
+/// `ObjectDropped` carries the targeted object so the tree can refresh.
+fn drop_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    stmt: String,
+    obj: ObjectRef,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                client
+                    .execute(ExecuteRequest::new(&stmt))
+                    .await
+                    .map_err(|e| format!("{stmt}\n  → {e}"))?;
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        move |res| Message::ObjectDropped(obj.clone(), res),
     )
 }
 
@@ -817,49 +926,220 @@ impl App {
                 }
                 Task::none()
             }
-            Message::SelectConnection(i) => {
-                self.selected = Some(i);
-                let (name, state, id) = {
-                    let e = &self.entries[i];
-                    (e.cfg.name.clone(), e.state.clone(), e.cfg.id)
+            Message::SelectConnection(i) => self.select_connection(i),
+            Message::TreeToggleConn(id) => {
+                self.context_menu = None;
+                let Some(i) = self.entries.iter().position(|e| e.cfg.id == id) else {
+                    return Task::none();
                 };
-                // Rebind the ACTIVE TAB to this connection: the sidebar picks
-                // the database that the current workspace talks to.
-                self.active_id = Some(id);
-                self.root = Some(ObjectRef::root(id));
-                self.query_context = None;
-                self.selected_object = None;
-                self.sync = None;
-                self.sync_pending = None;
-                self.completion.close();
-                self.completion.dictionary = self
-                    .completion_words
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default();
-                match state {
-                    ConnState::Connected => {
-                        self.status = format!("conectada: {name}");
+                let root = ObjectRef::root(id);
+                if self.active_id == Some(id) && self.expanded.contains(&root) {
+                    self.expanded.remove(&root);
+                    self.selected = Some(i);
+                    return Task::none();
+                }
+                self.selected = Some(i);
+                self.expanded.insert(root);
+                self.select_connection(i)
+            }
+            Message::TreeRootToggle => {
+                self.context_menu = None;
+                self.expanded_root = !self.expanded_root;
+                Task::none()
+            }
+            Message::TreeFilter(f) => {
+                self.tree_filter = f;
+                Task::none()
+            }
+            Message::ContextOpen(target) => {
+                self.context_menu = Some(ContextMenu {
+                    target,
+                    confirm: false,
+                });
+                Task::none()
+            }
+            Message::ContextClose => {
+                self.context_menu = None;
+                Task::none()
+            }
+            Message::ContextAct(act) => {
+                // Taking the menu closes it; only AskDelete re-opens it in
+                // its destructive second step.
+                let Some(menu) = self.context_menu.take() else {
+                    return Task::none();
+                };
+                match act {
+                    ContextAct::AskDelete => {
+                        self.context_menu = Some(ContextMenu {
+                            target: menu.target,
+                            confirm: true,
+                        });
                         Task::none()
                     }
-                    ConnState::Connecting => {
-                        self.status = format!("conectando… {name}");
-                        Task::none()
+                    ContextAct::Cancel => Task::none(),
+                    ContextAct::CopyName => {
+                        let name = match &menu.target {
+                            MenuTarget::Conn(id) => self
+                                .entries
+                                .iter()
+                                .find(|e| e.cfg.id == *id)
+                                .map(|e| e.cfg.name.clone()),
+                            MenuTarget::Node(obj, _) => obj.path.last().cloned(),
+                        };
+                        match name {
+                            Some(n) => {
+                                self.status = format!("copiado: {n}");
+                                iced::clipboard::write(n)
+                            }
+                            None => Task::none(),
+                        }
                     }
-                    ConnState::Idle => {
-                        self.status = format!("conectando: {name}");
-                        let cfg = self.entries[i].cfg.clone();
-                        self.entries[i].state = ConnState::Connecting;
-                        connect_task(self.rt.clone(), cfg)
+                    ContextAct::EditConn => {
+                        let MenuTarget::Conn(id) = menu.target else {
+                            return Task::none();
+                        };
+                        let Some(i) =
+                            self.entries.iter().position(|e| e.cfg.id == id)
+                        else {
+                            return Task::none();
+                        };
+                        self.selected = Some(i);
+                        self.update(Message::EditSelected)
                     }
-                    ConnState::Error(err) => {
-                        self.status = format!("reintentando {name}: {err}");
-                        let cfg = self.entries[i].cfg.clone();
-                        self.entries[i].state = ConnState::Connecting;
-                        connect_task(self.rt.clone(), cfg)
+                    ContextAct::Refresh => match &menu.target {
+                        MenuTarget::Conn(id) => {
+                            let id = *id;
+                            let Some(i) =
+                                self.entries.iter().position(|e| e.cfg.id == id)
+                            else {
+                                return Task::none();
+                            };
+                            if self.sessions.contains_key(&id) {
+                                let root = ObjectRef::root(id);
+                                self.tree.remove(&root);
+                                self.load_children(&root)
+                            } else {
+                                self.select_connection(i)
+                            }
+                        }
+                        MenuTarget::Node(obj, _) => {
+                            let obj = obj.clone();
+                            self.reload_children(&obj)
+                        }
+                    },
+                    ContextAct::Open => {
+                        let MenuTarget::Node(obj, kind) = menu.target else {
+                            return Task::none();
+                        };
+                        if !matches!(
+                            kind,
+                            ObjectKind::Table
+                                | ObjectKind::View
+                                | ObjectKind::Collection
+                        ) {
+                            return Task::none();
+                        }
+                        self.update(Message::TreeOpenObject(obj, kind))
                     }
+                    ContextAct::Design => {
+                        let MenuTarget::Node(obj, kind) = menu.target else {
+                            return Task::none();
+                        };
+                        if kind != ObjectKind::Table {
+                            return Task::none();
+                        }
+                        self.selected_object = Some((obj, kind));
+                        self.update(Message::DesignSelected)
+                    }
+                    ContextAct::NewTable => match &menu.target {
+                        MenuTarget::Node(obj, kind)
+                            if matches!(
+                                kind,
+                                ObjectKind::Database | ObjectKind::Schema
+                            ) =>
+                        {
+                            let (obj, kind) = (obj.clone(), *kind);
+                            self.selected_object = Some((obj, kind));
+                            self.update(Message::DesignNew)
+                        }
+                        MenuTarget::Conn(id) => {
+                            let id = *id;
+                            let Some(i) =
+                                self.entries.iter().position(|e| e.cfg.id == id)
+                            else {
+                                return Task::none();
+                            };
+                            let bind = self.select_connection(i);
+                            let open = self.update(Message::DesignNew);
+                            Task::batch([bind, open])
+                        }
+                        _ => Task::none(),
+                    },
+                    ContextAct::ConfirmDelete => match menu.target {
+                        MenuTarget::Conn(id) => {
+                            let Some(i) =
+                                self.entries.iter().position(|e| e.cfg.id == id)
+                            else {
+                                return Task::none();
+                            };
+                            self.selected = Some(i);
+                            self.update(Message::DeleteSelected)
+                        }
+                        MenuTarget::Node(obj, kind)
+                            if matches!(kind, ObjectKind::Table | ObjectKind::View) =>
+                        {
+                            let engine = self.engine_of(obj.connection);
+                            if engine == Engine::Mongodb {
+                                return Task::none();
+                            }
+                            let Some(stmt) = drop_statement(engine, kind, &obj)
+                            else {
+                                return Task::none();
+                            };
+                            let Some(session) =
+                                self.sessions.get(&obj.connection).cloned()
+                            else {
+                                self.status =
+                                    "sin sesión: no se puede eliminar".into();
+                                return Task::none();
+                            };
+                            let name = obj
+                                .path
+                                .last()
+                                .cloned()
+                                .unwrap_or_default();
+                            self.status = format!("eliminando {name}…");
+                            drop_task(
+                                self.rt.clone(),
+                                session.client.clone(),
+                                stmt,
+                                obj,
+                            )
+                        }
+                        _ => Task::none(),
+                    },
                 }
             }
+            Message::ObjectDropped(obj, res) => match res {
+                Ok(()) => {
+                    let name = obj.path.last().cloned().unwrap_or_default();
+                    self.status = format!("✓ eliminada: {name}");
+                    self.invalidate_after_ddl(&obj);
+                    // Re-list the parent right away so the row vanishes
+                    // without forcing the user to collapse/expand it.
+                    if let Some(parent) = obj.parent() {
+                        self.tree.remove(&parent);
+                        self.expanded.remove(&parent);
+                        let reload = self.expand(&parent);
+                        return reload;
+                    }
+                    Task::none()
+                }
+                Err(e) => {
+                    self.status = format!("error al eliminar: {e}");
+                    Task::none()
+                }
+            },
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -1117,6 +1397,8 @@ impl App {
                 Task::none()
             }
             Message::TreeToggle(node, kind) => {
+                // A plain click dismisses any context menu.
+                self.context_menu = None;
                 // Expanding a database/schema also selects it: it seeds the
                 // parent for "Nueva tabla" and shows where you are.
                 if matches!(kind, ObjectKind::Database | ObjectKind::Schema) {
@@ -1125,10 +1407,12 @@ impl App {
                 self.expand(&node)
             }
             Message::TreeSelect(node, kind) => {
+                self.context_menu = None;
                 self.selected_object = Some((node, kind));
                 Task::none()
             }
             Message::TreeOpenObject(obj, kind) => {
+                self.context_menu = None;
                 let sql = self.query_for(&obj, kind);
                 self.query_context = match kind {
                     ObjectKind::Collection => Some(obj.path.join(".")),
@@ -1172,6 +1456,9 @@ impl App {
             Message::CompletionClose => {
                 if self.completion.open {
                     self.completion.close();
+                } else if self.context_menu.is_some() {
+                    // Esc with no popup up dismisses the context menu.
+                    self.context_menu = None;
                 }
                 Task::none()
             }
@@ -1830,6 +2117,56 @@ impl App {
         }
     }
 
+    /// Select a connection (tree row or legacy list): rebind the active
+    /// tab to it, refresh side panels and connect when idle.
+    fn select_connection(&mut self, i: usize) -> Task<Message> {
+        let Some(entry) = self.entries.get(i) else {
+            return Task::none();
+        };
+        self.selected = Some(i);
+        let (name, state, id) = (
+            entry.cfg.name.clone(),
+            entry.state.clone(),
+            entry.cfg.id,
+        );
+        // Rebind the ACTIVE TAB to this connection: the sidebar picks
+        // the database that the current workspace talks to.
+        self.active_id = Some(id);
+        self.root = Some(ObjectRef::root(id));
+        self.query_context = None;
+        self.selected_object = None;
+        self.sync = None;
+        self.sync_pending = None;
+        self.completion.close();
+        self.completion.dictionary = self
+            .completion_words
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        match state {
+            ConnState::Connected => {
+                self.status = format!("conectada: {name}");
+                Task::none()
+            }
+            ConnState::Connecting => {
+                self.status = format!("conectando… {name}");
+                Task::none()
+            }
+            ConnState::Idle => {
+                self.status = format!("conectando: {name}");
+                let cfg = self.entries[i].cfg.clone();
+                self.entries[i].state = ConnState::Connecting;
+                connect_task(self.rt.clone(), cfg)
+            }
+            ConnState::Error(err) => {
+                self.status = format!("reintentando {name}: {err}");
+                let cfg = self.entries[i].cfg.clone();
+                self.entries[i].state = ConnState::Connecting;
+                connect_task(self.rt.clone(), cfg)
+            }
+        }
+    }
+
     /// Engine of a connection id (defaults to SQLite for display paths that
     /// run before any entry is loaded).
     fn engine_of(&self, id: ConnectionId) -> Engine {
@@ -1857,8 +2194,21 @@ impl App {
         if self.tree.contains_key(node) {
             return Task::none();
         }
-        // Every node carries its connection (`child()` propagates it), so
-        // multi-DB tabs can each expand their own tree via the shared map.
+        self.load_children(node)
+    }
+
+    /// Fetch `node`'s children right now (cache is already cleared by the
+    /// caller): used by right-click "Actualizar" on nodes and roots.
+    fn reload_children(&mut self, node: &ObjectRef) -> Task<Message> {
+        self.tree.remove(node);
+        self.expanded.insert(node.clone());
+        self.load_children(node)
+    }
+
+    /// Background listing for one node; every node carries its connection
+    /// (`child()` propagates it), so multi-DB tabs each expand their own
+    /// tree via the shared map.
+    fn load_children(&self, node: &ObjectRef) -> Task<Message> {
         let Some(session) = self.sessions.get(&node.connection).cloned() else {
             return Task::none();
         };
@@ -2330,41 +2680,119 @@ impl App {
                     .style(theme::workspace),
             );
         } else {
-            for (i, entry) in self.entries.iter().enumerate() {
-                let (marker, marker_color) = match &entry.state {
-                    ConnState::Connected => ("●", theme::engine_color(entry.cfg.engine)),
-                    ConnState::Connecting => ("◐", theme::engine_color(entry.cfg.engine)),
-                    ConnState::Idle => ("○", theme::muted()),
-                    ConnState::Error(_) => ("✕", iced::color!(0xd93025)),
-                };
-                let label = row![
-                    icons::svg(icons::Icon::Connection, 14.0),
-                    text(marker).size(11).color(marker_color),
-                    text(entry.cfg.name.clone()).size(13),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center);
-                let row_style: fn(&Theme, button::Status) -> button::Style =
-                    if self.selected == Some(i) {
-                        theme::row_selected
-                    } else {
-                        theme::flat
+            // ── unified tree: "Mis conexiones" → connections → objects ──
+            let filter = self.tree_filter.trim().to_string();
+            let filter_active = !filter.is_empty();
+            let root_open = self.expanded_root || filter_active;
+            let root_marker = if root_open { "▾" } else { "▸" };
+            navigator = navigator.push(
+                button(
+                    container(
+                        row![
+                            text(root_marker).size(11).color(theme::muted()),
+                            icons::svg(icons::Icon::Connection, 14.0),
+                            text("Mis conexiones").size(13),
+                        ]
+                        .spacing(4)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(iced::Padding {
+                        top: 2.0,
+                        right: 6.0,
+                        bottom: 2.0,
+                        left: 6.0,
+                    }),
+                )
+                .width(Length::Fill)
+                .style(theme::flat)
+                .on_press(Message::TreeRootToggle),
+            );
+            if root_open {
+                for (i, entry) in self.entries.iter().enumerate() {
+                    let conn_root = ObjectRef::root(entry.cfg.id);
+                    if filter_active
+                        && !node_matches(&entry.cfg.name, &filter)
+                        && !subtree_matches(self, &conn_root, &filter)
+                    {
+                        continue;
+                    }
+                    let (marker, marker_color) = match &entry.state {
+                        ConnState::Connected => ("●", theme::engine_color(entry.cfg.engine)),
+                        ConnState::Connecting => ("◐", theme::engine_color(entry.cfg.engine)),
+                        ConnState::Idle => ("○", theme::muted()),
+                        ConnState::Error(_) => ("✕", iced::color!(0xd93025)),
                     };
-                navigator = navigator.push(
-                    button(label)
-                        .width(Length::Fill)
-                        .on_press(Message::SelectConnection(i))
-                        .style(row_style),
-                );
-            }
-            if let Some(root) = &self.root {
-                navigator = push_tree(self, root, 0, navigator);
+                    let open = self.expanded.contains(&conn_root);
+                    let arrow = if open { "▾" } else { "▸" };
+                    let label = row![
+                        text(arrow).size(11).color(theme::muted()),
+                        icons::svg(icons::Icon::Connection, 14.0),
+                        text(marker).size(11).color(marker_color),
+                        text(entry.cfg.name.clone()).size(13),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center);
+                    let row_style: fn(&Theme, button::Status) -> button::Style =
+                        if self.selected == Some(i) {
+                            theme::row_selected
+                        } else {
+                            theme::flat
+                        };
+                    navigator = navigator.push(
+                        MouseArea::new(
+                            button(
+                                container(label)
+                                    .padding(iced::Padding {
+                                        top: 2.0,
+                                        right: 6.0,
+                                        bottom: 2.0,
+                                        left: 20.0,
+                                    }),
+                            )
+                            .width(Length::Fill)
+                            .style(row_style)
+                            .on_press(Message::TreeToggleConn(entry.cfg.id)),
+                        )
+                        .on_right_press(Message::ContextOpen(MenuTarget::Conn(
+                            entry.cfg.id,
+                        ))),
+                    );
+                    if let Some(menu) = &self.context_menu {
+                        if matches!(
+                            &menu.target,
+                            MenuTarget::Conn(id) if *id == entry.cfg.id
+                        ) {
+                            navigator = navigator.push(context_menu_view(self, menu));
+                        }
+                    }
+                    if open || filter_active {
+                        navigator = push_tree(self, &conn_root, 1, navigator);
+                    }
+                }
             }
         }
         let conn_count = self.entries.len();
+        let filter_active = !self.tree_filter.trim().is_empty();
+        let mut filter_row = row![
+            text_input("Buscar objeto…", &self.tree_filter)
+                .on_input(Message::TreeFilter)
+                .size(12)
+                .padding([5, 7]),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+        if filter_active {
+            filter_row = filter_row.push(
+                button(text("✕").size(11))
+                    .padding([3, 7])
+                    .style(theme::flat)
+                    .on_press(Message::TreeFilter(String::new())),
+            );
+        }
         let navigator = container(
             Column::new()
                 .push(scrollable(navigator).height(Length::Fill))
+                .push(filter_row)
                 .push(
                     text(if conn_count == 1 {
                         "1 conexión".to_string()
@@ -2700,6 +3128,28 @@ fn quote_ident(seg: &str, engine: Engine) -> String {
     }
 }
 
+/// `DROP TABLE/VIEW` for a tree object, qualified like `query_for_engine`
+/// does (SQLite is bare; MySQL gets `db.table`, Postgres `schema.table`).
+/// Returns `None` for kinds that cannot be dropped (collections, columns…).
+fn drop_statement(engine: Engine, kind: ObjectKind, obj: &ObjectRef) -> Option<String> {
+    let keyword = match kind {
+        ObjectKind::Table => "DROP TABLE",
+        ObjectKind::View => "DROP VIEW",
+        _ => return None,
+    };
+    let name = obj.path.last()?;
+    let quoted = quote_ident(name, engine);
+    let full = if engine == Engine::Sqlite {
+        quoted
+    } else {
+        match obj.path.get(obj.path.len().wrapping_sub(2)) {
+            Some(seg) => format!("{}.{}", quote_ident(seg, engine), quoted),
+            None => quoted,
+        }
+    };
+    Some(format!("{keyword} {full};"))
+}
+
 /// Toolbar button in the Navicat style: big icon above a small caption.
 /// `msg = None` renders the button disabled (greyed out).
 fn tool_btn(
@@ -2727,16 +3177,202 @@ fn tool_btn(
     }
 }
 
+/// One row of the navigator context menu: icon + caption, full width.
+fn menu_item(
+    icon: icons::Icon,
+    label: &'static str,
+    act: ContextAct,
+) -> Element<'static, Message> {
+    button(
+        row![icons::svg(icon, 14.0), text(label).size(12)]
+            .spacing(7)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding(iced::Padding {
+        top: 4.0,
+        right: 8.0,
+        bottom: 4.0,
+        left: 8.0,
+    })
+    .width(Length::Fill)
+    .style(theme::flat)
+    .on_press(Message::ContextAct(act))
+    .into()
+}
+
+/// Context menu panel, rendered right below the row it belongs to.
+/// The `confirm` state swaps the items for the destructive second step
+/// ("¿Eliminar…?"), so a DROP never fires from a single click.
+fn context_menu_view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
+    let title: String = match &menu.target {
+        MenuTarget::Conn(id) => app
+            .entries
+            .iter()
+            .find(|e| e.cfg.id == *id)
+            .map(|e| e.cfg.name.clone())
+            .unwrap_or_else(|| "conexión".to_string()),
+        MenuTarget::Node(obj, _) => obj.path.last().cloned().unwrap_or_default(),
+    };
+    let header = row![
+        text(title.clone()).size(11).color(theme::muted()),
+        Space::new().width(Length::Fill),
+        button(text("✕").size(11))
+            .padding([2.0, 7.0])
+            .style(theme::flat)
+            .on_press(Message::ContextClose),
+    ]
+    .align_y(iced::Alignment::Center);
+
+    let mut body = Column::new().spacing(1).push(header);
+    if menu.confirm {
+        body = body
+            .push(text(format!("¿Eliminar «{title}»?")).size(12))
+            .push(
+                text("Esta acción no se puede deshacer.")
+                    .size(11)
+                    .color(theme::muted()),
+            )
+            .push(menu_item(
+                icons::Icon::Delete,
+                "Sí, eliminar",
+                ContextAct::ConfirmDelete,
+            ))
+            .push(menu_item(icons::Icon::Close, "Cancelar", ContextAct::Cancel));
+    } else {
+        match &menu.target {
+            MenuTarget::Conn(_) => {
+                body = body
+                    .push(menu_item(
+                        icons::Icon::Design,
+                        "Editar conexión…",
+                        ContextAct::EditConn,
+                    ))
+                    .push(menu_item(
+                        icons::Icon::Refresh,
+                        "Actualizar",
+                        ContextAct::Refresh,
+                    ))
+                    .push(menu_item(
+                        icons::Icon::NewTable,
+                        "Nueva tabla…",
+                        ContextAct::NewTable,
+                    ))
+                    .push(menu_item(
+                        icons::Icon::Copy,
+                        "Copiar nombre",
+                        ContextAct::CopyName,
+                    ))
+                    .push(menu_item(
+                        icons::Icon::Delete,
+                        "Eliminar conexión…",
+                        ContextAct::AskDelete,
+                    ));
+            }
+            MenuTarget::Node(obj, kind) => match kind {
+                ObjectKind::Database | ObjectKind::Schema => {
+                    body = body
+                        .push(menu_item(
+                            icons::Icon::NewTable,
+                            "Nueva tabla…",
+                            ContextAct::NewTable,
+                        ))
+                        .push(menu_item(
+                            icons::Icon::Refresh,
+                            "Actualizar",
+                            ContextAct::Refresh,
+                        ))
+                        .push(menu_item(
+                            icons::Icon::Copy,
+                            "Copiar nombre",
+                            ContextAct::CopyName,
+                        ));
+                }
+                ObjectKind::Table | ObjectKind::View => {
+                    let engine = app.engine_of(obj.connection);
+                    let sql_db = engine != Engine::Mongodb;
+                    body = body.push(menu_item(
+                        icons::Icon::Open,
+                        "Abrir",
+                        ContextAct::Open,
+                    ));
+                    if *kind == ObjectKind::Table && sql_db {
+                        body = body.push(menu_item(
+                            icons::Icon::Design,
+                            "Diseñar",
+                            ContextAct::Design,
+                        ));
+                    }
+                    body = body
+                        .push(menu_item(
+                            icons::Icon::Refresh,
+                            "Actualizar",
+                            ContextAct::Refresh,
+                        ))
+                        .push(menu_item(
+                            icons::Icon::Copy,
+                            "Copiar nombre",
+                            ContextAct::CopyName,
+                        ));
+                    if sql_db {
+                        body = body.push(menu_item(
+                            icons::Icon::Delete,
+                            "Eliminar…",
+                            ContextAct::AskDelete,
+                        ));
+                    }
+                }
+                ObjectKind::Collection => {
+                    body = body
+                        .push(menu_item(
+                            icons::Icon::Open,
+                            "Abrir",
+                            ContextAct::Open,
+                        ))
+                        .push(menu_item(
+                            icons::Icon::Refresh,
+                            "Actualizar",
+                            ContextAct::Refresh,
+                        ))
+                        .push(menu_item(
+                            icons::Icon::Copy,
+                            "Copiar nombre",
+                            ContextAct::CopyName,
+                        ));
+                }
+                _ => {
+                    body = body.push(menu_item(
+                        icons::Icon::Copy,
+                        "Copiar nombre",
+                        ContextAct::CopyName,
+                    ));
+                }
+            },
+        }
+    }
+    container(body)
+        .padding(6)
+        .width(Length::Fill)
+        .style(theme::workspace)
+        .into()
+}
+
 fn push_tree<'a>(
     app: &'a App,
     parent: &ObjectRef,
     depth: usize,
     mut col: Column<'a, Message>,
 ) -> Column<'a, Message> {
+    let filter_active = !app.tree_filter.trim().is_empty();
     let Some(children) = app.tree.get(parent) else {
         return col;
     };
     for node in children {
+        if filter_active
+            && !node_matches(&node.label, &app.tree_filter)
+            && !subtree_matches(app, &node.object, &app.tree_filter)
+        {
+            continue;
+        }
         let is_open = app.expanded.contains(&node.object);
         let marker = match (node.has_children, is_open) {
             (true, true) => "▾",
@@ -2769,20 +3405,34 @@ fn push_tree<'a>(
         .spacing(4)
         .align_y(iced::Alignment::Center);
         col = col.push(
-            button(
-                container(label)
-                    .padding(iced::Padding {
-                        top: 2.0,
-                        right: 6.0,
-                        bottom: 2.0,
-                        left: 6.0 + depth as f32 * 14.0,
-                    }),
+            MouseArea::new(
+                button(
+                    container(label)
+                        .padding(iced::Padding {
+                            top: 2.0,
+                            right: 6.0,
+                            bottom: 2.0,
+                            left: 6.0 + depth as f32 * 14.0,
+                        }),
+                )
+                .width(Length::Fill)
+                .style(row_style)
+                .on_press(press),
             )
-            .width(Length::Fill)
-            .style(row_style)
-            .on_press(press),
+            .on_right_press(Message::ContextOpen(MenuTarget::Node(
+                node.object.clone(),
+                node.kind,
+            ))),
         );
-        if is_open {
+        if let Some(menu) = &app.context_menu {
+            if matches!(
+                &menu.target,
+                MenuTarget::Node(o, k) if *o == node.object && *k == node.kind
+            ) {
+                col = col.push(context_menu_view(app, menu));
+            }
+        }
+        if is_open || filter_active {
             col = push_tree(app, &node.object, depth + 1, col);
         }
     }
@@ -3247,6 +3897,45 @@ mod tests {
     fn view_generates_select_like_table() {
         let sql = query_for_engine(Engine::Postgres, &obj(&["appdb", "public", "v_activos"]), ObjectKind::View);
         assert_eq!(sql, "SELECT * FROM \"public\".\"v_activos\" LIMIT 100;");
+    }
+
+    #[test]
+    fn tree_filter_matches_case_insensitively() {
+        assert!(node_matches("Pedidos", ""));
+        assert!(node_matches("Pedidos", "   "));
+        assert!(node_matches("pedidos_2024", "PEDID"));
+        assert!(node_matches("usuarios", "suari"));
+        assert!(!node_matches("usuarios", "pedidos"));
+    }
+
+    #[test]
+    fn drop_statement_qualifies_per_engine() {
+        // SQLite is file-scoped: no qualification.
+        let t = obj(&["appdb", "pedidos"]);
+        assert_eq!(
+            drop_statement(Engine::Sqlite, ObjectKind::Table, &t),
+            Some("DROP TABLE \"pedidos\";".into())
+        );
+        // MySQL: `db`.`table`.
+        assert_eq!(
+            drop_statement(Engine::Mysql, ObjectKind::Table, &t),
+            Some("DROP TABLE `appdb`.`pedidos`;".into())
+        );
+        // Postgres: schema-qualified (path = [db, schema, table]).
+        let pg = obj(&["appdb", "public", "v_activos"]);
+        assert_eq!(
+            drop_statement(Engine::Postgres, ObjectKind::View, &pg),
+            Some("DROP VIEW \"public\".\"v_activos\";".into())
+        );
+        // Mongo collections and columns are not droppable this way.
+        assert_eq!(drop_statement(Engine::Mongodb, ObjectKind::Collection, &t), None);
+        assert_eq!(drop_statement(Engine::Postgres, ObjectKind::Column, &t), None);
+        // Quote doubles inside identifiers.
+        let weird = obj(&["a\"b"]);
+        assert_eq!(
+            drop_statement(Engine::Sqlite, ObjectKind::Table, &weird),
+            Some("DROP TABLE \"a\"\"b\";".into())
+        );
     }
 
     #[test]
