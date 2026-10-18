@@ -11,7 +11,7 @@ dbstudio-secrets = { workspace = true }
 dirs = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-iced = { workspace = true, features = ["tokio"] }
+iced = { workspace = true, features = ["tokio", "svg"] }
 iced-code-editor = { workspace = true }
 iced-autocomplete = { workspace = true }
 oriel-core = { workspace = true }

@@ -11,6 +11,7 @@ mod er;
 mod export;
 mod form;
 mod grid;
+mod icons;
 mod store;
 mod sync;
 mod theme;
@@ -171,7 +172,9 @@ enum Message {
     /// handshakes can be attributed to the right entry.
     Connected(Result<ConnectedPayload, (ConnectionId, String)>),
     ChildrenLoaded(ObjectRef, Result<Vec<ObjectNode>, String>),
-    TreeToggle(ObjectRef),
+    TreeToggle(ObjectRef, ObjectKind),
+    /// Select a leaf node without loading children (columns and friends).
+    TreeSelect(ObjectRef, ObjectKind),
     /// Table/view/collection clicked: put a starter query in the editor and
     /// expand the node's children.
     TreeOpenObject(ObjectRef, ObjectKind),
@@ -1113,7 +1116,18 @@ impl App {
                 self.status = format!("error de conexión: {e}");
                 Task::none()
             }
-            Message::TreeToggle(node) => self.expand(&node),
+            Message::TreeToggle(node, kind) => {
+                // Expanding a database/schema also selects it: it seeds the
+                // parent for "Nueva tabla" and shows where you are.
+                if matches!(kind, ObjectKind::Database | ObjectKind::Schema) {
+                    self.selected_object = Some((node.clone(), kind));
+                }
+                self.expand(&node)
+            }
+            Message::TreeSelect(node, kind) => {
+                self.selected_object = Some((node, kind));
+                Task::none()
+            }
             Message::TreeOpenObject(obj, kind) => {
                 let sql = self.query_for(&obj, kind);
                 self.query_context = match kind {
@@ -2195,48 +2209,50 @@ impl App {
         .height(Length::Fill)
         .align_y(iced::Alignment::Center);
 
+        let er_msg = self.active_id.is_some().then_some(Message::ErOpen);
+        let theme_icon = if self.dark {
+            icons::Icon::Moon
+        } else {
+            icons::Icon::Sun
+        };
         let toolbar = row![
             text("jorgenio dbstudio").size(14),
-            button(text("+ Nueva conexión").size(13))
-                .on_press(Message::OpenForm)
-                .style(theme::flat),
-            button(text("Ejecutar (F5)").size(13))
-                .on_press(Message::Run)
-                .style(theme::solid),
-            button(text(if self.dark { "☾ claro" } else { "☀ oscuro" }).size(13))
-                .on_press(Message::ToggleTheme)
-                .style(theme::flat),
-            button(text("⇄ ER").size(13))
-                .on_press_maybe(self.active_id.is_some().then_some(Message::ErOpen))
-                .style(theme::flat),
-            button(text("＋ Tabla").size(13))
-                .on_press_maybe(
-                    (self.active_id.is_some()
-                        && self.engine_of(self.active_id.unwrap()) != Engine::Mongodb)
-                        .then_some(Message::DesignNew),
-                )
-                .style(theme::flat),
-            button(text("Diseñador").size(13))
-                .on_press_maybe(
-                    self.selected_object
-                        .as_ref()
-                        .is_some_and(|(o, k)| *k == ObjectKind::Table && self.sessions.contains_key(&o.connection))
-                        .then_some(Message::DesignSelected),
-                )
-                .style(theme::flat),
-            button(text("⇄ Sincronizar").size(13))
-                .on_press_maybe(
-                    self.selected_object.as_ref().is_some_and(|(o, k)| {
-                        *k == ObjectKind::Table
-                            && self.sessions.contains_key(&o.connection)
-                            && self
-                                .sessions
-                                .keys()
-                                .any(|id| *id != o.connection)
-                    })
-                    .then_some(Message::SyncOpen),
-                )
-                .style(theme::flat),
+            tool_btn(icons::Icon::Add, "Conexión", Some(Message::OpenForm), false),
+            tool_btn(icons::Icon::Query, "Nueva consulta", Some(Message::NewTab), false),
+            tool_btn(icons::Icon::Run, "Ejecutar", Some(Message::Run), true),
+            tool_btn(
+                icons::Icon::NewTable,
+                "Nueva tabla",
+                (self.active_id.is_some()
+                    && self.engine_of(self.active_id.unwrap()) != Engine::Mongodb)
+                    .then_some(Message::DesignNew),
+                false
+            ),
+            tool_btn(
+                icons::Icon::Design,
+                "Diseñador",
+                self.selected_object
+                    .as_ref()
+                    .is_some_and(|(o, k)| *k == ObjectKind::Table && self.sessions.contains_key(&o.connection))
+                    .then_some(Message::DesignSelected),
+                false
+            ),
+            tool_btn(
+                icons::Icon::Sync,
+                "Sincronizar",
+                self.selected_object.as_ref().is_some_and(|(o, k)| {
+                    *k == ObjectKind::Table
+                        && self.sessions.contains_key(&o.connection)
+                        && self
+                            .sessions
+                            .keys()
+                            .any(|id| *id != o.connection)
+                })
+                .then_some(Message::SyncOpen),
+                false
+            ),
+            tool_btn(icons::Icon::Er, "Diagrama ER", er_msg, false),
+            tool_btn(theme_icon, "Tema", Some(Message::ToggleTheme), false),
             rule::vertical(1).style(theme::hairline),
             container(auto_complete(
                 &self.search,
@@ -2260,7 +2276,7 @@ impl App {
         let title_bar = MouseArea::new(
             container(toolbar)
                 .width(Length::Fill)
-                .height(Length::Fixed(40.0))
+                .height(Length::Fixed(56.0))
                 .padding(iced::Padding {
                     top: 0.0,
                     right: 0.0,
@@ -2295,10 +2311,17 @@ impl App {
         }
         navigator = navigator.push(conn_header);
         navigator = navigator.push(
-            button(text("+ Nueva conexión").size(13))
-                .width(Length::Fill)
-                .on_press(Message::OpenForm)
-                .style(theme::flat),
+            button(
+                row![
+                    icons::svg(icons::Icon::Add, 13.0),
+                    text("+ Nueva conexión").size(13),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .on_press(Message::OpenForm)
+            .style(theme::flat),
         );
         if let Some(form) = &self.form {
             navigator = navigator.push(
@@ -2315,6 +2338,7 @@ impl App {
                     ConnState::Error(_) => ("✕", iced::color!(0xd93025)),
                 };
                 let label = row![
+                    icons::svg(icons::Icon::Connection, 14.0),
                     text(marker).size(11).color(marker_color),
                     text(entry.cfg.name.clone()).size(13),
                 ]
@@ -2337,11 +2361,25 @@ impl App {
                 navigator = push_tree(self, root, 0, navigator);
             }
         }
-        let navigator = container(scrollable(navigator).height(Length::Fill))
-            .width(Length::Fixed(260.0))
-            .height(Length::Fill)
-            .padding(6)
-            .style(theme::navigator);
+        let conn_count = self.entries.len();
+        let navigator = container(
+            Column::new()
+                .push(scrollable(navigator).height(Length::Fill))
+                .push(
+                    text(if conn_count == 1 {
+                        "1 conexión".to_string()
+                    } else {
+                        format!("{conn_count} conexiones")
+                    })
+                    .size(11)
+                    .color(theme::muted()),
+                )
+                .spacing(6),
+        )
+        .width(Length::Fixed(260.0))
+        .height(Length::Fill)
+        .padding(6)
+        .style(theme::navigator);
 
         // ── editor pane with its tab strip ──────────────────────────────
         let mut tab_row = row![].spacing(4).align_y(iced::Alignment::Center);
@@ -2354,9 +2392,16 @@ impl App {
                 };
             tab_row = tab_row.push(
                 row![
-                    button(text(format!(" {} ", tab.title)).size(13))
-                        .style(style)
-                        .on_press(Message::SelectTab(i)),
+                    button(
+                        row![
+                            icons::svg(icons::Icon::Query, 13.0),
+                            text(format!(" {} ", tab.title)).size(13),
+                        ]
+                        .spacing(4)
+                        .align_y(iced::Alignment::Center)
+                    )
+                    .style(style)
+                    .on_press(Message::SelectTab(i)),
                     button(text("✕").size(10))
                         .style(theme::flat)
                         .on_press(Message::CloseTab(i)),
@@ -2655,6 +2700,33 @@ fn quote_ident(seg: &str, engine: Engine) -> String {
     }
 }
 
+/// Toolbar button in the Navicat style: big icon above a small caption.
+/// `msg = None` renders the button disabled (greyed out).
+fn tool_btn(
+    icon: icons::Icon,
+    label: &'static str,
+    msg: Option<Message>,
+    primary: bool,
+) -> Element<'static, Message> {
+    let inner = Column::new()
+        .push(icons::svg(icon, 20.0))
+        .push(text(label).size(10))
+        .spacing(3)
+        .align_x(iced::Alignment::Center);
+    let b = button(inner)
+        .padding(iced::Padding {
+            top: 4.0,
+            right: 9.0,
+            bottom: 3.0,
+            left: 9.0,
+        })
+        .style(if primary { theme::solid } else { theme::flat });
+    match msg {
+        Some(m) => b.on_press(m).into(),
+        None => b.into(),
+    }
+}
+
 fn push_tree<'a>(
     app: &'a App,
     parent: &ObjectRef,
@@ -2671,18 +2743,44 @@ fn push_tree<'a>(
             (true, false) => "▸",
             (false, _) => "·",
         };
-        let pad = "  ".repeat(depth);
         let press = match node.kind {
             ObjectKind::Table | ObjectKind::View | ObjectKind::Collection => {
                 Message::TreeOpenObject(node.object.clone(), node.kind)
             }
-            _ => Message::TreeToggle(node.object.clone()),
+            ObjectKind::Database | ObjectKind::Schema => {
+                Message::TreeToggle(node.object.clone(), node.kind)
+            }
+            _ => Message::TreeSelect(node.object.clone(), node.kind),
         };
+        let is_selected = app
+            .selected_object
+            .as_ref()
+            .is_some_and(|(obj, _)| *obj == node.object);
+        let row_style: fn(&Theme, button::Status) -> button::Style = if is_selected {
+            theme::row_selected
+        } else {
+            theme::flat
+        };
+        let label = row![
+            text(marker).size(11).color(theme::muted()),
+            icons::svg(icons::Icon::for_kind(node.kind), 14.0),
+            text(node.label.clone()).size(13),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
         col = col.push(
-            button(text(format!("{pad}{marker} {}", node.label)).size(13))
-                .width(Length::Fill)
-                .style(theme::flat)
-                .on_press(press),
+            button(
+                container(label)
+                    .padding(iced::Padding {
+                        top: 2.0,
+                        right: 6.0,
+                        bottom: 2.0,
+                        left: 6.0 + depth as f32 * 14.0,
+                    }),
+            )
+            .width(Length::Fill)
+            .style(row_style)
+            .on_press(press),
         );
         if is_open {
             col = push_tree(app, &node.object, depth + 1, col);
