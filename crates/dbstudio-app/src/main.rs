@@ -133,6 +133,10 @@ struct App {
     expanded_root: bool,
     /// Right-click menu over a navigator row (connection or object node).
     context_menu: Option<ContextMenu>,
+    /// Objects-panel overlay for the selected container, when open.
+    objects: Option<ObjectsState>,
+    /// Last left-click on a navigator row, for time-based double click.
+    tree_last_click: Option<(TreeClickTarget, std::time::Instant)>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -273,6 +277,17 @@ enum Message {
     ContextAct(ContextAct),
     /// `DROP TABLE/VIEW` finished for `ObjectRef` (Ok) or failed (Err).
     ObjectDropped(ObjectRef, Result<(), String>),
+    /// Objects panel: show the children of a container (connection root,
+    /// database or schema) as a Navicat-style list in the workspace.
+    ObjectsOpen(ObjectRef, ObjectKind),
+    /// Close the objects panel (✕ or opening a query tab from a row).
+    ObjectsClose,
+    /// Panel search box.
+    ObjectsFilter(String),
+    /// Row click; two quick clicks (by time) open the object as a tab.
+    ObjectsRowClick(usize),
+    /// Toolbar actions of the objects panel.
+    ObjectsAction(ObjectsAction),
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -310,6 +325,49 @@ enum ContextAct {
     ConfirmDelete,
     /// Leave the confirmation step (closes the menu).
     Cancel,
+}
+
+/// Toolbar actions of the objects panel.
+#[derive(Clone, Copy, Debug)]
+enum ObjectsAction {
+    /// Force a fresh listing of the container's children.
+    Refresh,
+    /// New table under the panel's database/schema.
+    NewTable,
+    /// Open the designer for the selected table row.
+    Design,
+    /// Arm the two-step delete for the selected table/view row.
+    Delete,
+    /// Run the DROP armed by `Delete`.
+    ConfirmDelete,
+    /// Disarm the delete confirmation.
+    CancelDelete,
+}
+
+/// Objects-panel overlay: the children of the selected container shown as
+/// a Navicat-style list (toolbar + search + rows) in the central area.
+struct ObjectsState {
+    /// Container whose children are listed (connection root / db / schema).
+    container: ObjectRef,
+    /// Kind of `container` (Connection, Database or Schema).
+    kind: ObjectKind,
+    /// Panel search box text.
+    filter: String,
+    /// Selected row index (into the *filtered* rows).
+    selected: Option<usize>,
+    /// Last click per row for time-based double click detection.
+    last_click: Option<(usize, std::time::Instant)>,
+    /// Destructive delete confirmation showing.
+    confirm: bool,
+}
+
+/// Which navigator row the last left-click hit (time-based double click;
+/// `MouseArea::on_double_click` never fires wrapping a button because the
+/// button captures the left press first).
+#[derive(Clone, PartialEq, Debug)]
+enum TreeClickTarget {
+    Conn(ConnectionId),
+    Node(ObjectRef),
 }
 
 type ConnectedPayload = (ConnectionId, Arc<Session>, ObjectRef, Vec<ObjectNode>);
@@ -483,6 +541,8 @@ fn boot() -> (App, Task<Message>) {
             tree_filter: String::new(),
             expanded_root: true,
             context_menu: None,
+            objects: None,
+            tree_last_click: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -614,6 +674,55 @@ fn subtree_matches(app: &App, node: &ObjectRef, filter: &str) -> bool {
     children.iter().any(|c| {
         node_matches(&c.label, filter) || subtree_matches(app, &c.object, filter)
     })
+}
+
+/// Rows of the objects panel: the container's loaded children, narrowed by
+/// the panel's filter box (index in this vec = row index in the panel).
+fn filtered_nodes<'a>(
+    tree: &'a HashMap<ObjectRef, Vec<ObjectNode>>,
+    container: &ObjectRef,
+    filter: &str,
+) -> Vec<&'a ObjectNode> {
+    tree.get(container)
+        .map(|children| {
+            children
+                .iter()
+                .filter(|n| node_matches(&n.label, filter))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Time-based double click (iced reports one press per click; rows have
+/// no native double-click event, and `MouseArea::on_double_click` cannot
+/// see left presses when the content button captures them first).
+fn is_double_click<K: PartialEq>(
+    last: Option<&(K, std::time::Instant)>,
+    key: &K,
+    now: std::time::Instant,
+) -> bool {
+    matches!(
+        last,
+        Some((k, t)) if k == key && now.duration_since(*t) < std::time::Duration::from_millis(400)
+    )
+}
+
+/// Spanish caption for an object kind (objects panel columns).
+fn kind_label(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Connection => "Conexión",
+        ObjectKind::Database => "Base de datos",
+        ObjectKind::Schema => "Esquema",
+        ObjectKind::Collection => "Colección",
+        ObjectKind::Table => "Tabla",
+        ObjectKind::View => "Vista",
+        ObjectKind::Column => "Columna",
+        ObjectKind::Index => "Índice",
+        ObjectKind::Function => "Función",
+        ObjectKind::Procedure => "Procedimiento",
+        ObjectKind::Trigger => "Trigger",
+        ObjectKind::User => "Usuario",
+    }
 }
 
 /// Container a new table would live in, derived from the last object the
@@ -928,19 +1037,38 @@ impl App {
             }
             Message::SelectConnection(i) => self.select_connection(i),
             Message::TreeToggleConn(id) => {
+                let now = std::time::Instant::now();
+                let dbl = is_double_click(
+                    self.tree_last_click.as_ref(),
+                    &TreeClickTarget::Conn(id),
+                    now,
+                );
+                self.tree_last_click = Some((TreeClickTarget::Conn(id), now));
                 self.context_menu = None;
                 let Some(i) = self.entries.iter().position(|e| e.cfg.id == id) else {
                     return Task::none();
                 };
                 let root = ObjectRef::root(id);
-                if self.active_id == Some(id) && self.expanded.contains(&root) {
+                let toggle = if self.active_id == Some(id) && self.expanded.contains(&root) {
                     self.expanded.remove(&root);
                     self.selected = Some(i);
-                    return Task::none();
+                    Task::none()
+                } else {
+                    self.selected = Some(i);
+                    self.expanded.insert(root.clone());
+                    self.select_connection(i)
+                };
+                if dbl {
+                    // Second quick click on the same connection: list its
+                    // databases in the objects panel (Navicat double-click).
+                    self.expanded.insert(root.clone());
+                    Task::batch([
+                        toggle,
+                        self.update(Message::ObjectsOpen(root, ObjectKind::Connection)),
+                    ])
+                } else {
+                    toggle
                 }
-                self.selected = Some(i);
-                self.expanded.insert(root);
-                self.select_connection(i)
             }
             Message::TreeRootToggle => {
                 self.context_menu = None;
@@ -1140,6 +1268,204 @@ impl App {
                     Task::none()
                 }
             },
+            Message::ObjectsOpen(node, kind) => {
+                self.context_menu = None;
+                self.objects = Some(ObjectsState {
+                    container: node.clone(),
+                    kind,
+                    filter: String::new(),
+                    selected: None,
+                    last_click: None,
+                    confirm: false,
+                });
+                // The panel reads `tree` live: make sure the listing is on
+                // its way (expand keeps the node open in the sidebar too).
+                self.expanded.insert(node.clone());
+                if self.tree.contains_key(&node) {
+                    Task::none()
+                } else {
+                    self.load_children(&node)
+                }
+            }
+            Message::ObjectsClose => {
+                self.objects = None;
+                Task::none()
+            }
+            Message::ObjectsFilter(f) => {
+                if let Some(o) = &mut self.objects {
+                    o.filter = f;
+                    o.selected = None;
+                    o.last_click = None;
+                    o.confirm = false;
+                }
+                Task::none()
+            }
+            Message::ObjectsRowClick(i) => {
+                let now = std::time::Instant::now();
+                let Some(o) = &mut self.objects else {
+                    return Task::none();
+                };
+                if !is_double_click(o.last_click.as_ref(), &i, now) {
+                    o.last_click = Some((i, now));
+                    o.selected = Some(i);
+                    o.confirm = false;
+                    return Task::none();
+                }
+                o.last_click = None;
+                let Some(row) =
+                    filtered_nodes(&self.tree, &o.container, &o.filter)
+                        .get(i)
+                        .map(|n| (*n).clone())
+                else {
+                    return Task::none();
+                };
+                match row.kind {
+                    // Leaves open as a query tab (Navicat double-click).
+                    ObjectKind::Table | ObjectKind::View | ObjectKind::Collection => {
+                        self.objects = None;
+                        self.update(Message::TreeOpenObject(row.object, row.kind))
+                    }
+                    // Containers drill the panel deeper.
+                    ObjectKind::Connection
+                    | ObjectKind::Database
+                    | ObjectKind::Schema => {
+                        let node = row.object;
+                        let kind = row.kind;
+                        self.objects = Some(ObjectsState {
+                            container: node.clone(),
+                            kind,
+                            filter: String::new(),
+                            selected: None,
+                            last_click: None,
+                            confirm: false,
+                        });
+                        self.expanded.insert(node.clone());
+                        if self.tree.contains_key(&node) {
+                            Task::none()
+                        } else {
+                            self.load_children(&node)
+                        }
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::ObjectsAction(act) => {
+                let Some(o) = &self.objects else {
+                    return Task::none();
+                };
+                let container = o.container.clone();
+                let ckind = o.kind;
+                let sel_row = {
+                    let rows = filtered_nodes(&self.tree, &container, &o.filter);
+                    o.selected
+                        .and_then(|i| rows.get(i).map(|n| (*n).clone()))
+                };
+                match act {
+                    ObjectsAction::Refresh => {
+                        self.objects.as_mut().map(|o| o.confirm = false);
+                        self.reload_children(&container)
+                    }
+                    ObjectsAction::NewTable => {
+                        if !matches!(
+                            ckind,
+                            ObjectKind::Database | ObjectKind::Schema
+                        ) {
+                            return Task::none();
+                        }
+                        // DesignNew binds to the active connection: rebind
+                        // the workspace when the panel belongs to another.
+                        let bind = if self.active_id != Some(container.connection) {
+                            match self
+                                .entries
+                                .iter()
+                                .position(|e| e.cfg.id == container.connection)
+                            {
+                                Some(i) => self.select_connection(i),
+                                None => {
+                                    self.status =
+                                        "conexión no disponible".to_string();
+                                    return Task::none();
+                                }
+                            }
+                        } else {
+                            Task::none()
+                        };
+                        self.selected_object = Some((container, ckind));
+                        let open = self.update(Message::DesignNew);
+                        Task::batch([bind, open])
+                    }
+                    ObjectsAction::Design => {
+                        let Some(row) = sel_row else {
+                            return Task::none();
+                        };
+                        if row.kind != ObjectKind::Table {
+                            return Task::none();
+                        }
+                        self.selected_object =
+                            Some((row.object, ObjectKind::Table));
+                        self.update(Message::DesignSelected)
+                    }
+                    ObjectsAction::Delete => {
+                        let Some(row) = sel_row else {
+                            return Task::none();
+                        };
+                        if !matches!(
+                            row.kind,
+                            ObjectKind::Table | ObjectKind::View
+                        ) || self.engine_of(row.object.connection) == Engine::Mongodb
+                        {
+                            return Task::none();
+                        }
+                        if let Some(o) = &mut self.objects {
+                            o.confirm = true;
+                        }
+                        Task::none()
+                    }
+                    ObjectsAction::ConfirmDelete => {
+                        let Some(row) = sel_row else {
+                            return Task::none();
+                        };
+                        if !matches!(
+                            row.kind,
+                            ObjectKind::Table | ObjectKind::View
+                        ) {
+                            return Task::none();
+                        }
+                        let engine = self.engine_of(row.object.connection);
+                        if engine == Engine::Mongodb {
+                            return Task::none();
+                        }
+                        let Some(stmt) = drop_statement(engine, row.kind, &row.object)
+                        else {
+                            return Task::none();
+                        };
+                        let Some(session) =
+                            self.sessions.get(&row.object.connection).cloned()
+                        else {
+                            self.status =
+                                "sin sesión: no se puede eliminar".to_string();
+                            return Task::none();
+                        };
+                        if let Some(o) = &mut self.objects {
+                            o.confirm = false;
+                        }
+                        self.status =
+                            format!("eliminando {}…", row.label);
+                        drop_task(
+                            self.rt.clone(),
+                            session.client.clone(),
+                            stmt,
+                            row.object,
+                        )
+                    }
+                    ObjectsAction::CancelDelete => {
+                        if let Some(o) = &mut self.objects {
+                            o.confirm = false;
+                        }
+                        Task::none()
+                    }
+                }
+            }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -1155,6 +1481,9 @@ impl App {
                 }
                 if self.designer.as_ref().is_some_and(|d| d.connection == removed.cfg.id) {
                     self.designer = None;
+                }
+                if self.objects.as_ref().is_some_and(|o| o.container.connection == removed.cfg.id) {
+                    self.objects = None;
                 }
                 if self.design_pending == Some(removed.cfg.id) {
                     self.design_pending = None;
@@ -1397,6 +1726,13 @@ impl App {
                 Task::none()
             }
             Message::TreeToggle(node, kind) => {
+                let now = std::time::Instant::now();
+                let dbl = is_double_click(
+                    self.tree_last_click.as_ref(),
+                    &TreeClickTarget::Node(node.clone()),
+                    now,
+                );
+                self.tree_last_click = Some((TreeClickTarget::Node(node.clone()), now));
                 // A plain click dismisses any context menu.
                 self.context_menu = None;
                 // Expanding a database/schema also selects it: it seeds the
@@ -1404,7 +1740,14 @@ impl App {
                 if matches!(kind, ObjectKind::Database | ObjectKind::Schema) {
                     self.selected_object = Some((node.clone(), kind));
                 }
-                self.expand(&node)
+                let expand = self.expand(&node);
+                if dbl {
+                    // Second quick click on the same database/schema: list
+                    // its children in the objects panel (Navicat double-click).
+                    Task::batch([expand, self.update(Message::ObjectsOpen(node, kind))])
+                } else {
+                    expand
+                }
             }
             Message::TreeSelect(node, kind) => {
                 self.context_menu = None;
@@ -2137,6 +2480,7 @@ impl App {
         self.selected_object = None;
         self.sync = None;
         self.sync_pending = None;
+        self.objects = None;
         self.completion.close();
         self.completion.dictionary = self
             .completion_words
@@ -2532,6 +2876,171 @@ impl App {
             .into()
     }
 
+    /// Objects panel: Navicat-style list of a container's children with a
+    /// toolbar (Recargar / Nueva tabla / Diseñar / Eliminar / Volver) and a
+    /// search box. Double-click (by time) opens a row as a query tab;
+    /// Database/Schema rows drill the panel deeper.
+    fn objects_view<'a>(&'a self, o: &'a ObjectsState) -> Element<'a, Message> {
+        let engine = self.engine_of(o.container.connection);
+        let sql_db = engine != Engine::Mongodb;
+        let rows = filtered_nodes(&self.tree, &o.container, &o.filter);
+        let sel = o.selected.and_then(|i| rows.get(i).copied());
+        let title = o.container.path.last().cloned().unwrap_or_else(|| {
+            // Connection root: show the entry's name.
+            self.entries
+                .iter()
+                .find(|e| e.cfg.id == o.container.connection)
+                .map(|e| e.cfg.name.clone())
+                .unwrap_or_default()
+        });
+
+        let act_btn = |icon: icons::Icon,
+                       label: &'static str,
+                       act: ObjectsAction,
+                       enabled: bool|
+         -> Element<'static, Message> {
+            button(
+                row![icons::svg(icon, 14.0), text(label).size(12)]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+            )
+            .padding([4.0, 8.0])
+            .style(theme::flat)
+            .on_press_maybe(enabled.then_some(Message::ObjectsAction(act)))
+            .into()
+        };
+
+        let strip = container(
+            row![
+                icons::svg(icons::Icon::for_kind(o.kind), 16.0),
+                text(format!("{} · {}", kind_label(o.kind), title)).size(13),
+                act_btn(
+                    icons::Icon::Refresh,
+                    "Recargar",
+                    ObjectsAction::Refresh,
+                    true
+                ),
+                act_btn(
+                    icons::Icon::NewTable,
+                    "Nueva tabla",
+                    ObjectsAction::NewTable,
+                    sql_db
+                        && matches!(o.kind, ObjectKind::Database | ObjectKind::Schema),
+                ),
+                act_btn(
+                    icons::Icon::Design,
+                    "Diseñar",
+                    ObjectsAction::Design,
+                    sql_db && sel.is_some_and(|n| n.kind == ObjectKind::Table),
+                ),
+                act_btn(
+                    icons::Icon::Delete,
+                    "Eliminar",
+                    ObjectsAction::Delete,
+                    sql_db
+                        && sel
+                            .is_some_and(|n| matches!(n.kind, ObjectKind::Table | ObjectKind::View)),
+                ),
+                button(text("✕ Volver").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::ObjectsClose),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 6.0,
+            left: 6.0,
+        })
+        .style(theme::chrome);
+
+        // Two-step delete: the armed confirmation replaces the search row.
+        let filter_row: Element<'_, Message> = if o.confirm {
+            let name = sel.map(|n| n.label.clone()).unwrap_or_default();
+            row![
+                text(format!(
+                    "¿Eliminar «{name}»? Esta acción no se puede deshacer."
+                ))
+                .size(12),
+                button(text("Sí, eliminar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::solid)
+                    .on_press(Message::ObjectsAction(ObjectsAction::ConfirmDelete)),
+                button(text("Cancelar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::ObjectsAction(ObjectsAction::CancelDelete)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            row![
+                icons::svg(icons::Icon::Search, 13.0),
+                text_input("Buscar objeto…", &o.filter)
+                    .on_input(Message::ObjectsFilter)
+                    .size(12)
+                    .padding([5.0, 7.0]),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        let mut list: Column<'_, Message> = Column::new().spacing(1);
+        if rows.is_empty() {
+            let msg = if !self.tree.contains_key(&o.container) {
+                "cargando objetos…"
+            } else if o.filter.trim().is_empty() {
+                "sin objetos en este contenedor"
+            } else {
+                "sin coincidencias"
+            };
+            list = list.push(text(msg).size(12).color(theme::muted()));
+        }
+        for (i, node) in rows.iter().enumerate() {
+            let style: fn(&Theme, button::Status) -> button::Style = if o.selected == Some(i) {
+                theme::row_selected
+            } else {
+                theme::flat
+            };
+            let mut label = row![
+                icons::svg(icons::Icon::for_kind(node.kind), 14.0),
+                text(node.label.clone()).size(13),
+                Space::new().width(Length::Fill),
+                text(kind_label(node.kind)).size(11).color(theme::muted()),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if let Some(detail) = &node.detail {
+                label = label.push(text(detail.clone()).size(11).color(theme::muted()));
+            }
+            list = list.push(
+                button(container(label).padding([3.0, 8.0]))
+                    .width(Length::Fill)
+                    .style(style)
+                    .on_press(Message::ObjectsRowClick(i)),
+            );
+        }
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(
+                container(filter_row)
+                    .padding([6.0, 8.0])
+                    .width(Length::Fill)
+                    .style(theme::chrome),
+            )
+            .push(scrollable(container(list).padding([4.0, 8.0])).height(Length::Fill))
+            .width(Length::Fill)
+            .into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         // ── custom title bar: brand + actions + window controls ─────────
         // Frameless window: the bar replaces the native title bar, so it is
@@ -2906,20 +3415,23 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        // The sync/designer/ER overlays replace the editor + results while open.
-        let center: Element<'_, Message> = match (&self.sync, &self.designer, &self.er) {
-            (Some(s), _, _) => self.sync_view(s),
-            (None, Some(d), _) => self.designer_view(d),
-            (None, None, Some(er)) => self.er_view(er),
-            (None, None, None) => Column::new()
-                .push(editor_tabs)
-                .push(editor.height(Length::FillPortion(2)))
-                .push(rule::horizontal(1).style(theme::hairline))
-                .push(result_strip)
-                .push(grid.height(Length::FillPortion(3)))
-                .width(Length::Fill)
-                .into(),
-        };
+        // The sync/designer/ER/objects overlays replace the editor + results
+        // while open (lowest priority: the objects panel).
+        let center: Element<'_, Message> =
+            match (&self.sync, &self.designer, &self.er, &self.objects) {
+                (Some(s), _, _, _) => self.sync_view(s),
+                (None, Some(d), _, _) => self.designer_view(d),
+                (None, None, Some(er), _) => self.er_view(er),
+                (None, None, None, Some(o)) => self.objects_view(o),
+                (None, None, None, None) => Column::new()
+                    .push(editor_tabs)
+                    .push(editor.height(Length::FillPortion(2)))
+                    .push(rule::horizontal(1).style(theme::hairline))
+                    .push(result_strip)
+                    .push(grid.height(Length::FillPortion(3)))
+                    .width(Length::Fill)
+                    .into(),
+            };
 
         let main = row![navigator, center];
 
@@ -3985,6 +4497,45 @@ mod tests {
         assert_eq!(run(&s).len(), 1);
         s.name = "  ".into();
         assert!(run(&s).is_empty());
+    }
+
+    #[test]
+    fn objects_panel_filters_rows_and_double_click_uses_time() {
+        use std::time::{Duration, Instant};
+
+        let id = ConnectionId::nil();
+        let root = ObjectRef::root(id);
+        let mut tree: HashMap<ObjectRef, Vec<ObjectNode>> = HashMap::new();
+        tree.insert(
+            root.clone(),
+            vec![
+                ObjectNode::leaf(root.child("tienda"), ObjectKind::Database, "tienda"),
+                ObjectNode::leaf(root.child("reportes"), ObjectKind::Database, "reportes"),
+            ],
+        );
+
+        // Empty filter lists everything; a substring narrows; no matches
+        // and unknown containers list nothing.
+        assert_eq!(filtered_nodes(&tree, &root, "").len(), 2);
+        assert_eq!(filtered_nodes(&tree, &root, "tiend").len(), 1);
+        assert!(filtered_nodes(&tree, &root, "zzz").is_empty());
+        assert!(filtered_nodes(&tree, &root.child("otra"), "").is_empty());
+
+        // Double click: same row, quick succession (<400ms).
+        let t0 = Instant::now();
+        let last: Option<(usize, Instant)> = Some((0, t0));
+        assert!(!is_double_click(None, &0, t0));
+        assert!(!is_double_click(Some(&(1, t0)), &0, t0));
+        assert!(is_double_click(
+            last.as_ref(),
+            &0,
+            t0 + Duration::from_millis(120)
+        ));
+        assert!(!is_double_click(
+            last.as_ref(),
+            &0,
+            t0 + Duration::from_millis(401)
+        ));
     }
 }
 
