@@ -151,6 +151,8 @@ struct App {
     import: Option<ImportState>,
     /// Auto-refresh interval for the result grid (timer via subscription).
     auto_refresh: RefreshEvery,
+    /// Users/roles overlay (listing + DDL form), when open.
+    users: Option<UsersState>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -355,6 +357,21 @@ enum Message {
     DumpTo(ObjectRef, Option<std::path::PathBuf>),
     /// Respaldo terminado: ruta escrita y filas volcadas, o error.
     DumpDone(Result<(String, usize), String>),
+    // ── gestión de usuarios/roles de la conexión ──
+    UsersClose,
+    UsersRefresh,
+    UsersLoaded(Result<Vec<UserRow>, String>),
+    UsersCreate,
+    UsersAlter(String),
+    UsersDropAsk(String),
+    UsersDropCancel,
+    UsersDropConfirm(String),
+    UsersEditCancel,
+    UsersField(UserField, String),
+    UsersToggleLogin,
+    UsersToggleSuper,
+    UsersRun,
+    UsersApplied(Result<String, String>),
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -382,6 +399,8 @@ enum ContextAct {
     ImportData,
     /// Open the save dialog for a SQL dump (DROP + CREATE + INSERT).
     DumpData,
+    /// Open the users/roles overlay for a connection.
+    Users,
     /// New table under a database/schema (or from a connection row).
     NewTable,
     /// Force a fresh children listing (connection root or node).
@@ -624,6 +643,116 @@ fn auto_refreshable(sql: &str) -> bool {
         first.as_str(),
         "SELECT" | "WITH" | "SHOW" | "PRAGMA" | "EXPLAIN" | "DESCRIBE"
     )
+}
+
+/// Account listing row: `name` is the account, `host` exists only on
+/// MySQL/MariaDB (identity is user@host), `detail` carries the second
+/// reported column (host, role class, principal type…).
+#[derive(Clone, Debug)]
+struct UserRow {
+    name: String,
+    host: Option<String>,
+    detail: String,
+}
+
+/// Editable field of the user form (drives `Message::UsersField`).
+#[derive(Clone, Copy, Debug)]
+enum UserField {
+    Name,
+    Password,
+    Host,
+}
+
+/// Which statement family to generate for the form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UserAction {
+    Create,
+    Alter,
+}
+
+/// Create/alter form: `altered = Some(original name)` marks alter mode (v1
+/// never renames accounts).
+#[derive(Clone, Debug)]
+struct UserEdit {
+    name: String,
+    password: String,
+    host: String,
+    can_login: bool,
+    superuser: bool,
+    altered: Option<String>,
+}
+
+impl UserEdit {
+    fn create() -> Self {
+        Self {
+            name: String::new(),
+            password: String::new(),
+            host: "%".into(),
+            can_login: true,
+            superuser: false,
+            altered: None,
+        }
+    }
+
+    fn alter(row: &UserRow) -> Self {
+        let detail = row.detail.to_ascii_lowercase();
+        Self {
+            name: row.name.clone(),
+            password: String::new(),
+            host: row.host.clone().unwrap_or_else(|| "%".into()),
+            // Postgres CASE: "super" / "grupo" / "login". MySQL's detail is
+            // the host (lock state unknown → assume active; the alter only
+            // ever adds ACCOUNT LOCK/UNLOCK explicitly).
+            can_login: !detail.contains("grupo"),
+            superuser: detail.contains("super"),
+            altered: Some(row.name.clone()),
+        }
+    }
+
+    fn action(&self) -> UserAction {
+        if self.altered.is_some() {
+            UserAction::Alter
+        } else {
+            UserAction::Create
+        }
+    }
+}
+
+/// Users/roles overlay: read-only listing plus a create/alter form with an
+/// inline DDL preview. Mutations v1 target MySQL/MariaDB and PostgreSQL;
+/// SQL Server lists only; SQLite/MongoDB/Oracle refuse to open.
+struct UsersState {
+    connection: ConnectionId,
+    engine: Engine,
+    loading: bool,
+    running: bool,
+    users: Vec<UserRow>,
+    error: Option<String>,
+    edit: Option<UserEdit>,
+    confirm_drop: Option<String>,
+}
+
+impl UsersState {
+    fn new(connection: ConnectionId, engine: Engine) -> Self {
+        Self {
+            connection,
+            engine,
+            loading: true,
+            running: false,
+            users: Vec::new(),
+            error: None,
+            edit: None,
+            confirm_drop: None,
+        }
+    }
+
+    /// DDL is only generated for engines with tested statements (v1).
+    fn can_mutate(&self) -> bool {
+        matches!(
+            self.engine,
+            Engine::Mysql | Engine::MariaDb | Engine::Postgres
+        )
+    }
 }
 
 /// Which navigator row the last left-click hit (time-based double click;
@@ -912,6 +1041,7 @@ fn boot() -> (App, Task<Message>) {
             data_pending: None,
             import: None,
             auto_refresh: RefreshEvery::Off,
+            users: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -1358,6 +1488,54 @@ fn dump_task(
     )
 }
 
+/// Load the account list of `engine` (read-only listing SQL).
+fn users_list_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    engine: Engine,
+) -> Task<Message> {
+    let Some(sql) = users_list_sql(engine) else {
+        return Task::none();
+    };
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let result = client
+                    .execute(ExecuteRequest::new(sql))
+                    .await
+                    .map_err(|e| format!("no se pudieron leer los usuarios: {e}"))?;
+                Ok::<Vec<UserRow>, String>(users_from_rows(engine, &result.rows))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::UsersLoaded,
+    )
+}
+
+/// Execute one user-management statement; `Ok` carries the status text.
+fn users_exec_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    sql: String,
+    done: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                client
+                    .execute(ExecuteRequest::new(&sql))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<String, String>(done)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::UsersApplied,
+    )
+}
+
 /// Run the designer's DDL statements sequentially; `Ok(n)` counts the ones
 /// that completed before any failure stopped the batch.
 fn design_apply_task(
@@ -1707,6 +1885,12 @@ impl App {
                         };
                         self.selected = Some(i);
                         self.update(Message::EditSelected)
+                    }
+                    ContextAct::Users => {
+                        let MenuTarget::Conn(id) = menu.target else {
+                            return Task::none();
+                        };
+                        self.users_open(id)
                     }
                     ContextAct::Refresh => match &menu.target {
                         MenuTarget::Conn(id) => {
@@ -2604,6 +2788,198 @@ impl App {
                 self.status = format!("respaldo falló: {e}");
                 Task::none()
             }
+            Message::UsersClose => {
+                self.users = None;
+                Task::none()
+            }
+            Message::UsersRefresh => {
+                let Some(st) = &self.users else {
+                    return Task::none();
+                };
+                let (engine, id) = (st.engine, st.connection);
+                let Some(session) = self.sessions.get(&id).cloned() else {
+                    self.status = "la conexión no está activa".to_string();
+                    return Task::none();
+                };
+                if let Some(st) = &mut self.users {
+                    st.loading = true;
+                    st.error = None;
+                    st.confirm_drop = None;
+                }
+                self.status = "leyendo usuarios…".to_string();
+                users_list_task(self.rt.clone(), session.client.clone(), engine)
+            }
+            Message::UsersLoaded(res) => {
+                let Some(st) = &mut self.users else {
+                    return Task::none();
+                };
+                st.loading = false;
+                match res {
+                    Ok(users) => {
+                        st.error = None;
+                        let n = users.len();
+                        st.users = users;
+                        self.status = format!("{n} cuentas");
+                    }
+                    Err(e) => {
+                        st.error = Some(e.clone());
+                        self.status = format!("no se pudieron leer los usuarios: {e}");
+                    }
+                }
+                Task::none()
+            }
+            Message::UsersCreate => {
+                if let Some(st) = &mut self.users {
+                    st.edit = Some(UserEdit::create());
+                    st.error = None;
+                    st.confirm_drop = None;
+                }
+                Task::none()
+            }
+            Message::UsersAlter(name) => {
+                let row = self.users.as_ref().and_then(|st| {
+                    st.users.iter().find(|r| r.name == name).cloned()
+                });
+                if let (Some(st), Some(row)) = (self.users.as_mut(), row) {
+                    st.edit = Some(UserEdit::alter(&row));
+                    st.error = None;
+                    st.confirm_drop = None;
+                }
+                Task::none()
+            }
+            Message::UsersDropAsk(name) => {
+                if let Some(st) = &mut self.users {
+                    st.confirm_drop = Some(name);
+                }
+                Task::none()
+            }
+            Message::UsersDropCancel => {
+                if let Some(st) = &mut self.users {
+                    st.confirm_drop = None;
+                    st.edit = None;
+                    st.error = None;
+                }
+                Task::none()
+            }
+            Message::UsersEditCancel => {
+                if let Some(st) = &mut self.users {
+                    st.edit = None;
+                    st.error = None;
+                }
+                Task::none()
+            }
+            Message::UsersDropConfirm(name) => {
+                let Some(st) = &self.users else {
+                    return Task::none();
+                };
+                let Some(row) = st.users.iter().find(|r| r.name == name).cloned() else {
+                    return Task::none();
+                };
+                let sql = match user_drop_sql(st.engine, &row) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.status = format!("error: {e}");
+                        return Task::none();
+                    }
+                };
+                let id = st.connection;
+                let Some(session) = self.sessions.get(&id).cloned() else {
+                    self.status = "la conexión no está activa".to_string();
+                    return Task::none();
+                };
+                if let Some(st) = &mut self.users {
+                    st.confirm_drop = None;
+                    st.running = true;
+                }
+                self.status = "eliminando usuario…".to_string();
+                users_exec_task(
+                    self.rt.clone(),
+                    session.client.clone(),
+                    sql,
+                    "usuario eliminado".to_string(),
+                )
+            }
+            Message::UsersField(field, value) => {
+                if let Some(edit) = self.users.as_mut().and_then(|st| st.edit.as_mut()) {
+                    match field {
+                        UserField::Name => edit.name = value,
+                        UserField::Password => edit.password = value,
+                        UserField::Host => edit.host = value,
+                    }
+                }
+                Task::none()
+            }
+            Message::UsersToggleLogin => {
+                if let Some(edit) = self.users.as_mut().and_then(|st| st.edit.as_mut()) {
+                    edit.can_login = !edit.can_login;
+                }
+                Task::none()
+            }
+            Message::UsersToggleSuper => {
+                if let Some(edit) = self.users.as_mut().and_then(|st| st.edit.as_mut()) {
+                    edit.superuser = !edit.superuser;
+                }
+                Task::none()
+            }
+            Message::UsersRun => {
+                let Some(st) = &self.users else {
+                    return Task::none();
+                };
+                if st.running {
+                    return Task::none();
+                }
+                let Some(edit) = &st.edit else {
+                    return Task::none();
+                };
+                let sql = match user_ddl(st.engine, edit.action(), edit) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.status = format!("error: {e}");
+                        return Task::none();
+                    }
+                };
+                let done = if edit.action() == UserAction::Alter {
+                    "usuario actualizado".to_string()
+                } else {
+                    "usuario creado".to_string()
+                };
+                let id = st.connection;
+                let Some(session) = self.sessions.get(&id).cloned() else {
+                    self.status = "la conexión no está activa".to_string();
+                    return Task::none();
+                };
+                if let Some(st) = &mut self.users {
+                    st.running = true;
+                    st.error = None;
+                }
+                self.status = "ejecutando DDL…".to_string();
+                users_exec_task(self.rt.clone(), session.client.clone(), sql, done)
+            }
+            Message::UsersApplied(res) => {
+                let Some(st) = &mut self.users else {
+                    return Task::none();
+                };
+                st.running = false;
+                match res {
+                    Ok(done) => {
+                        st.edit = None;
+                        st.error = None;
+                        self.status = format!("✓ {done}");
+                        let (engine, id) = (st.engine, st.connection);
+                        let Some(session) = self.sessions.get(&id).cloned() else {
+                            st.loading = false;
+                            return Task::none();
+                        };
+                        st.loading = true;
+                        users_list_task(self.rt.clone(), session.client.clone(), engine)
+                    }
+                    Err(e) => {
+                        st.error = Some(e.clone());
+                        self.status = format!("falló: {e}");
+                        Task::none()
+                    }
+                }
+            }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -2629,6 +3005,9 @@ impl App {
                 }
                 if self.import.as_ref().is_some_and(|s| s.connection == removed.cfg.id) {
                     self.import = None;
+                }
+                if self.users.as_ref().is_some_and(|s| s.connection == removed.cfg.id) {
+                    self.users = None;
                 }
                 if self.design_pending == Some(removed.cfg.id) {
                     self.design_pending = None;
@@ -3683,6 +4062,7 @@ impl App {
         self.sync_pending = None;
         self.objects = None;
         self.import = None;
+        self.users = None;
         self.data_edit = None;
         self.data_pending = None;
         self.completion.close();
@@ -4412,6 +4792,269 @@ impl App {
         )
     }
 
+    /// Open the users/roles overlay for a connection: read-only listing at
+    /// first; create/alter preview and run their DDL afterwards. SQLite has
+    /// no users, MongoDB manages DB roles and Oracle is deferred (v1).
+    fn users_open(&mut self, id: ConnectionId) -> Task<Message> {
+        let engine = self.engine_of(id);
+        if matches!(engine, Engine::Sqlite | Engine::Mongodb | Engine::Oracle) {
+            self.status = match engine {
+                Engine::Sqlite => "SQLite no tiene usuarios: la base es el archivo".to_string(),
+                Engine::Mongodb => {
+                    "MongoDB gestiona roles de base de datos: no disponible aún".to_string()
+                }
+                _ => "gestión de usuarios de Oracle postergada".to_string(),
+            };
+            return Task::none();
+        }
+        let Some(session) = self.sessions.get(&id).cloned() else {
+            self.status = "sin sesión: selecciónala de nuevo para ver usuarios".to_string();
+            return Task::none();
+        };
+        self.context_menu = None;
+        self.users = Some(UsersState::new(id, engine));
+        self.status = "leyendo usuarios…".to_string();
+        users_list_task(self.rt.clone(), session.client.clone(), engine)
+    }
+
+    /// Users overlay: the account list, or the create/alter form with its
+    /// inline DDL preview (same pane style as the sync plan).
+    fn users_view<'a>(&'a self, st: &'a UsersState) -> Element<'a, Message> {
+        let conn_name = self
+            .entries
+            .iter()
+            .find(|e| e.cfg.id == st.connection)
+            .map(|e| e.cfg.name.clone())
+            .unwrap_or_else(|| "conexión".to_string());
+
+        let strip = container(
+            row![
+                text(format!("  Usuarios · {conn_name}")).size(13),
+                if st.loading {
+                    text("cargando…").size(11).color(theme::muted())
+                } else {
+                    text("").size(11)
+                },
+                Space::new().width(Length::Fill),
+                button(text("Crear…").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press_maybe(
+                        (st.can_mutate() && st.edit.is_none() && !st.running && !st.loading)
+                            .then_some(Message::UsersCreate),
+                    ),
+                button(text("Actualizar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press_maybe(
+                        (st.edit.is_none() && !st.running && !st.loading)
+                            .then_some(Message::UsersRefresh),
+                    ),
+                button(text("✕ Cerrar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::UsersClose),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 6.0,
+            left: 6.0,
+        })
+        .style(theme::chrome);
+
+        let mut body = Column::new().spacing(10);
+        if let Some(edit) = &st.edit {
+            let action = edit.action();
+            let ddl = user_ddl(st.engine, action, edit);
+
+            let mut name_row = row![
+                text("Nombre:").size(11).color(theme::muted()),
+                text_input("usuario", &edit.name)
+                    .on_input(|v| Message::UsersField(UserField::Name, v))
+                    .size(12)
+                    .width(220.0),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if matches!(st.engine, Engine::Mysql | Engine::MariaDb) {
+                name_row = name_row
+                    .push(text("Host:").size(11).color(theme::muted()))
+                    .push(
+                        text_input("%", &edit.host)
+                            .on_input(|v| Message::UsersField(UserField::Host, v))
+                            .size(12)
+                            .width(150.0),
+                    );
+            }
+            body = body.push(name_row);
+
+            let mut pwd_row = row![
+                text("Contraseña:").size(11).color(theme::muted()),
+                text_input("vacía = sin cambio", &edit.password)
+                    .on_input(|v| Message::UsersField(UserField::Password, v))
+                    .size(12)
+                    .width(220.0)
+                    .secure(true),
+                text("Puede entrar").size(12),
+                checkbox(edit.can_login)
+                    .size(13)
+                    .on_toggle(|_| Message::UsersToggleLogin),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            if st.engine == Engine::Postgres {
+                pwd_row = pwd_row
+                    .push(text("Superusuario").size(12))
+                    .push(
+                        checkbox(edit.superuser)
+                            .size(13)
+                            .on_toggle(|_| Message::UsersToggleSuper),
+                    );
+            }
+            body = body.push(pwd_row);
+
+            let preview_sql = match &ddl {
+                Ok(sql) => sql.clone(),
+                Err(e) => format!("✗ {e}"),
+            };
+            body = body.push(
+                container(
+                    scrollable(text(preview_sql).size(12).font(iced::Font::MONOSPACE))
+                        .height(Length::Fixed(150.0)),
+                )
+                .padding(10)
+                .style(theme::workspace),
+            );
+
+            let action_label = match action {
+                UserAction::Create => "Ejecutar DDL",
+                UserAction::Alter => "Aplicar cambios",
+            };
+            body = body.push(
+                row![
+                    button(text(action_label).size(12))
+                        .padding([4.0, 10.0])
+                        .style(theme::solid)
+                        .on_press_maybe((ddl.is_ok() && !st.running).then_some(Message::UsersRun)),
+                    button(text("Cancelar").size(12))
+                        .padding([4.0, 10.0])
+                        .style(theme::flat)
+                        .on_press(Message::UsersEditCancel),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+            if st.running {
+                body = body.push(text("ejecutando…").size(11).color(theme::muted()));
+            }
+            if let Some(err) = &st.error {
+                body = body.push(text(format!("✗ {err}")).size(12));
+            }
+        } else {
+            if let Some(err) = &st.error {
+                body = body.push(text(format!("✗ {err}")).size(12));
+            }
+            if st.loading {
+                body = body.push(text("leyendo cuentas…").size(12).color(theme::muted()));
+            } else if st.users.is_empty() {
+                body = body.push(
+                    text("sin cuentas visibles (¿permisos de catálogo?)")
+                        .size(12)
+                        .color(theme::muted()),
+                );
+            } else {
+                body = body.push(
+                    container(
+                        row![
+                            container(text("Nombre").size(11).color(theme::muted()))
+                                .width(220.0),
+                            container(text("Detalle").size(11).color(theme::muted()))
+                                .width(200.0),
+                            Space::new().width(Length::Fill),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([2.0, 4.0]),
+                );
+                for row in &st.users {
+                    let confirm = st.confirm_drop.as_deref() == Some(row.name.as_str());
+                    let gated = st.can_mutate() && !st.running && st.edit.is_none();
+                    let mut actions = row![].spacing(6).align_y(iced::Alignment::Center);
+                    if confirm {
+                        actions = actions
+                            .push(text("¿Eliminar?").size(12))
+                            .push(
+                                button(text("Sí, eliminar").size(12))
+                                    .padding([2.0, 6.0])
+                                    .style(theme::flat)
+                                    .on_press_maybe(
+                                        gated.then_some(Message::UsersDropConfirm(row.name.clone())),
+                                    ),
+                            )
+                            .push(
+                                button(text("No").size(12))
+                                    .padding([2.0, 6.0])
+                                    .style(theme::flat)
+                                    .on_press(Message::UsersDropCancel),
+                            );
+                    } else {
+                        actions = actions
+                            .push(
+                                button(text("Modificar…").size(12))
+                                    .padding([2.0, 6.0])
+                                    .style(theme::flat)
+                                    .on_press_maybe(
+                                        gated.then_some(Message::UsersAlter(row.name.clone())),
+                                    ),
+                            )
+                            .push(
+                                button(text("Eliminar…").size(12))
+                                    .padding([2.0, 6.0])
+                                    .style(theme::flat)
+                                    .on_press_maybe(
+                                        gated.then_some(Message::UsersDropAsk(row.name.clone())),
+                                    ),
+                            );
+                    }
+                    body = body.push(
+                        container(
+                            row![
+                                container(text(row.name.as_str()).size(12)).width(220.0),
+                                container(text(row.detail.as_str()).size(12).color(theme::muted()))
+                                    .width(200.0),
+                                Space::new().width(Length::Fill),
+                                actions,
+                            ]
+                            .spacing(6)
+                            .align_y(iced::Alignment::Center),
+                        )
+                        .padding([3.0, 4.0]),
+                    );
+                }
+            }
+            if !st.can_mutate() {
+                body = body.push(
+                    text("solo consulta en este motor (v1: MySQL y PostgreSQL admiten cambios)")
+                        .size(11)
+                        .color(theme::muted()),
+                );
+            }
+        }
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(scrollable(container(body).padding(10)).height(Length::Fill))
+            .width(Length::Fill)
+            .into()
+    }
+
     /// Open the import wizard for a table: installs the state, reads the
     /// table's columns and opens the native file dialog.
     fn import_start(&mut self, table: ObjectRef) -> Task<Message> {
@@ -5061,13 +5704,21 @@ impl App {
         // results while open (highest priority: the import wizard, lowest:
         // the objects panel).
         let center: Element<'_, Message> =
-            match (&self.import, &self.sync, &self.designer, &self.er, &self.objects) {
-                (Some(imp), _, _, _, _) => self.import_view(imp),
-                (None, Some(s), _, _, _) => self.sync_view(s),
-                (None, None, Some(d), _, _) => self.designer_view(d),
-                (None, None, None, Some(er), _) => self.er_view(er),
-                (None, None, None, None, Some(o)) => self.objects_view(o),
-                (None, None, None, None, None) => {
+            match (
+                &self.users,
+                &self.import,
+                &self.sync,
+                &self.designer,
+                &self.er,
+                &self.objects,
+            ) {
+                (Some(u), _, _, _, _, _) => self.users_view(u),
+                (None, Some(imp), _, _, _, _) => self.import_view(imp),
+                (None, None, Some(s), _, _, _) => self.sync_view(s),
+                (None, None, None, Some(d), _, _) => self.designer_view(d),
+                (None, None, None, None, Some(er), _) => self.er_view(er),
+                (None, None, None, None, None, Some(o)) => self.objects_view(o),
+                (None, None, None, None, None, None) => {
                     let mut col = Column::new()
                         .push(editor_tabs)
                         .push(editor.height(Length::FillPortion(2)))
@@ -5566,6 +6217,150 @@ fn dump_text(
     Ok(out)
 }
 
+/// Read-only account listing per engine; `None` for engines without users.
+fn users_list_sql(engine: Engine) -> Option<String> {
+    match engine {
+        Engine::Mysql | Engine::MariaDb => Some(
+            "SELECT User, Host FROM mysql.user ORDER BY User, Host".to_string(),
+        ),
+        Engine::Postgres => Some(
+            "SELECT rolname, CASE WHEN rolsuper THEN 'super' \
+                   WHEN NOT rolcanlogin THEN 'grupo' ELSE 'login' END \
+                   FROM pg_roles ORDER BY rolname"
+                .to_string(),
+        ),
+        Engine::SqlServer => Some(
+            "SELECT name, type_desc FROM sys.database_principals \
+                   WHERE type IN ('S','U','G') \
+                   AND name NOT IN ('dbo','guest','sys','INFORMATION_SCHEMA') \
+                   ORDER BY name"
+                .to_string(),
+        ),
+        Engine::Sqlite | Engine::Mongodb | Engine::Oracle => None,
+    }
+}
+
+/// Parse a listing result: column 0 is the account, column 1 the host
+/// (MySQL) or the class/type detail (others). Short rows yield empty fields
+/// instead of panicking (defensive against dialect quirks).
+fn users_from_rows(engine: Engine, rows: &[Vec<CellValue>]) -> Vec<UserRow> {
+    rows.iter()
+        .map(|r| {
+            let get =
+                |i: usize| r.get(i).map(|c| c.as_display().into_owned()).unwrap_or_default();
+            let name = get(0);
+            let second = get(1);
+            let host = (engine == Engine::Mysql || engine == Engine::MariaDb)
+                .then(|| second.clone());
+            UserRow {
+                name,
+                host,
+                detail: second,
+            }
+        })
+        .collect()
+}
+
+/// CREATE/ALTER statement for the form (preview-ready) or the reason it
+/// cannot be generated. MySQL carries user@host identity and an explicit
+/// ACCOUNT LOCK/UNLOCK; Postgres uses LOGIN/SUPERUSER flags; password is
+/// only appended when non-empty.
+fn user_ddl(engine: Engine, action: UserAction, e: &UserEdit) -> Result<String, String> {
+    let name = e.name.trim();
+    if name.is_empty() {
+        return Err("falta el nombre de usuario".to_string());
+    }
+    match engine {
+        Engine::Mysql | Engine::MariaDb => {
+            let host_raw = e.host.trim();
+            let host = if host_raw.is_empty() { "%" } else { host_raw };
+            let ident = format!(
+                "{}@{}",
+                text_literal(engine, name),
+                text_literal(engine, host)
+            );
+            let mut sql = match action {
+                UserAction::Create => format!("CREATE USER {ident}"),
+                UserAction::Alter => format!("ALTER USER {ident}"),
+            };
+            if !e.password.is_empty() {
+                sql.push_str(&format!(
+                    " IDENTIFIED BY {}",
+                    text_literal(engine, &e.password)
+                ));
+            }
+            if action == UserAction::Alter {
+                // Always explicit: an "alter" with untouched fields must not
+                // silently re-open a locked account — it states its intent.
+                sql.push_str(if e.can_login {
+                    " ACCOUNT UNLOCK"
+                } else {
+                    " ACCOUNT LOCK"
+                });
+            } else if !e.can_login {
+                sql.push_str(" ACCOUNT LOCK");
+            }
+            sql.push(';');
+            Ok(sql)
+        }
+        Engine::Postgres => {
+            let ident = quote_ident(name, engine);
+            let mut sql = match action {
+                UserAction::Create => format!("CREATE USER {ident} WITH"),
+                UserAction::Alter => format!("ALTER USER {ident} WITH"),
+            };
+            sql.push_str(if e.can_login { " LOGIN" } else { " NOLOGIN" });
+            sql.push_str(if e.superuser {
+                " SUPERUSER"
+            } else {
+                " NOSUPERUSER"
+            });
+            if !e.password.is_empty() {
+                sql.push_str(&format!(
+                    " PASSWORD {}",
+                    text_literal(engine, &e.password)
+                ));
+            }
+            sql.push(';');
+            Ok(sql)
+        }
+        Engine::Sqlite | Engine::SqlServer | Engine::Mongodb | Engine::Oracle => Err(
+            "gestión de usuarios no disponible para este motor (v1: MySQL y PostgreSQL)"
+                .to_string(),
+        ),
+    }
+}
+
+/// DROP for a listed account (MySQL needs the host half of the identity).
+fn user_drop_sql(engine: Engine, row: &UserRow) -> Result<String, String> {
+    if row.name.trim().is_empty() {
+        return Err("fila sin nombre".to_string());
+    }
+    match engine {
+        Engine::Mysql | Engine::MariaDb => {
+            let host = row
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .unwrap_or("%");
+            Ok(format!(
+                "DROP USER {}@{};",
+                text_literal(engine, row.name.trim()),
+                text_literal(engine, host)
+            ))
+        }
+        Engine::Postgres => Ok(format!(
+            "DROP ROLE IF EXISTS {};",
+            quote_ident(row.name.trim(), engine)
+        )),
+        _ => Err(
+            "eliminación no disponible para este motor (v1: MySQL y PostgreSQL)"
+                .to_string(),
+        ),
+    }
+}
+
 /// One labeled field of the data-edit form: name (+PK dot, dirty bullet)
 /// over a value input and a NULL toggle. `disabled` locks blobs (they
 /// cannot round-trip through the text form).
@@ -5710,6 +6505,11 @@ fn context_menu_view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Mes
                         icons::Icon::Design,
                         "Editar conexión…",
                         ContextAct::EditConn,
+                    ))
+                    .push(menu_item(
+                        icons::Icon::User,
+                        "Usuarios…",
+                        ContextAct::Users,
                     ))
                     .push(menu_item(
                         icons::Icon::Refresh,
@@ -6871,6 +7671,163 @@ mod tests {
         let empty = dump_text(Engine::Sqlite, &table, &detail, &[]).expect("schema");
         assert!(empty.contains("CREATE TABLE"));
         assert!(!empty.contains("INSERT INTO"));
+    }
+
+    #[test]
+    fn users_list_sql_covers_sql_engines_only() {
+        assert!(users_list_sql(Engine::Mysql).is_some_and(|s| s.contains("mysql.user")));
+        assert!(users_list_sql(Engine::MariaDb).is_some_and(|s| s.contains("mysql.user")));
+        assert!(users_list_sql(Engine::Postgres).is_some_and(|s| s.contains("pg_roles")));
+        assert!(
+            users_list_sql(Engine::SqlServer)
+                .is_some_and(|s| s.contains("database_principals"))
+        );
+        assert!(users_list_sql(Engine::Sqlite).is_none());
+        assert!(users_list_sql(Engine::Mongodb).is_none());
+        assert!(users_list_sql(Engine::Oracle).is_none());
+    }
+
+    #[test]
+    fn user_ddl_mysql_create_alter_and_drop() {
+        let mut e = UserEdit::create();
+        e.name = "ana".into();
+        e.host = "%".into();
+        e.password = "secreto".into();
+        assert_eq!(
+            user_ddl(Engine::Mysql, UserAction::Create, &e).expect("ddl"),
+            "CREATE USER 'ana'@'%' IDENTIFIED BY 'secreto';"
+        );
+        // Host en blanco → % por defecto; comilla escapada al estilo MySQL.
+        e.host = "  ".into();
+        e.password = "p'1".into();
+        let sql = user_ddl(Engine::Mysql, UserAction::Create, &e).expect("ddl");
+        assert!(sql.starts_with("CREATE USER 'ana'@'%' IDENTIFIED BY "));
+        assert!(sql.contains("''"));
+        // Sin contraseña: sin cláusula IDENTIFIED BY.
+        e.password.clear();
+        assert_eq!(
+            user_ddl(Engine::Mysql, UserAction::Create, &e).expect("ddl"),
+            "CREATE USER 'ana'@'%';"
+        );
+        // ALTER always states an explicit lock clause (can re-open a lock).
+        assert_eq!(
+            user_ddl(Engine::Mysql, UserAction::Alter, &e).expect("ddl"),
+            "ALTER USER 'ana'@'%' ACCOUNT UNLOCK;"
+        );
+        e.can_login = false;
+        assert_eq!(
+            user_ddl(Engine::Mysql, UserAction::Alter, &e).expect("ddl"),
+            "ALTER USER 'ana'@'%' ACCOUNT LOCK;"
+        );
+        // DROP carries the host half of the identity (default %).
+        let row = UserRow {
+            name: "ana".into(),
+            host: Some("localhost".into()),
+            detail: "localhost".into(),
+        };
+        assert_eq!(
+            user_drop_sql(Engine::Mysql, &row).expect("drop"),
+            "DROP USER 'ana'@'localhost';"
+        );
+        let bare = UserRow {
+            name: "ana".into(),
+            host: None,
+            detail: String::new(),
+        };
+        assert_eq!(
+            user_drop_sql(Engine::Mysql, &bare).expect("drop"),
+            "DROP USER 'ana'@'%';"
+        );
+    }
+
+    #[test]
+    fn user_ddl_postgres_flags_and_password() {
+        let mut e = UserEdit::create();
+        e.name = "ana".into();
+        e.password = "x y".into();
+        assert_eq!(
+            user_ddl(Engine::Postgres, UserAction::Create, &e).expect("ddl"),
+            "CREATE USER \"ana\" WITH LOGIN NOSUPERUSER PASSWORD 'x y';"
+        );
+        e.name = "admin".into();
+        e.can_login = false;
+        e.superuser = true;
+        assert_eq!(
+            user_ddl(Engine::Postgres, UserAction::Create, &e).expect("ddl"),
+            "CREATE USER \"admin\" WITH NOLOGIN SUPERUSER PASSWORD 'x y';"
+        );
+        let sql = user_ddl(Engine::Postgres, UserAction::Alter, &e).expect("ddl");
+        assert!(sql.starts_with("ALTER USER \"admin\" WITH NOLOGIN SUPERUSER"));
+        let row = UserRow {
+            name: "admin".into(),
+            host: None,
+            detail: "login".into(),
+        };
+        assert_eq!(
+            user_drop_sql(Engine::Postgres, &row).expect("drop"),
+            "DROP ROLE IF EXISTS \"admin\";"
+        );
+    }
+
+    #[test]
+    fn user_ddl_rejects_empty_names_and_unsupported_engines() {
+        let empty = UserEdit::create();
+        assert!(user_ddl(Engine::Postgres, UserAction::Create, &empty).is_err());
+        let mut named = UserEdit::create();
+        named.name = "ana".into();
+        assert!(user_ddl(Engine::SqlServer, UserAction::Create, &named).is_err());
+        let row = UserRow {
+            name: "ana".into(),
+            host: None,
+            detail: String::new(),
+        };
+        assert!(user_drop_sql(Engine::Sqlite, &row).is_err());
+        assert!(user_drop_sql(Engine::SqlServer, &row).is_err());
+    }
+
+    #[test]
+    fn users_from_rows_parses_name_host_and_detail() {
+        let rows = vec![
+            vec![
+                CellValue::Text("ana".into()),
+                CellValue::Text("localhost".into()),
+            ],
+            vec![CellValue::Text("luis".into()), CellValue::Text("%".into())],
+        ];
+        let mine = users_from_rows(Engine::Mysql, &rows);
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].name, "ana");
+        assert_eq!(mine[0].host.as_deref(), Some("localhost"));
+        assert_eq!(mine[0].detail, "localhost");
+        let pg = users_from_rows(Engine::Postgres, &rows);
+        assert_eq!(pg[0].host, None);
+        assert_eq!(pg[0].detail, "localhost");
+        // Short row: no panic, empty fields.
+        let short = users_from_rows(Engine::Mysql, &[vec![CellValue::Text("x".into())]]);
+        assert_eq!(short[0].name, "x");
+        assert_eq!(short[0].host.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn user_edit_prefills_alter_from_listing() {
+        let row = UserRow {
+            name: "carla".into(),
+            host: None,
+            detail: "grupo".into(),
+        };
+        let edit = UserEdit::alter(&row);
+        assert_eq!(edit.action(), UserAction::Alter);
+        assert_eq!(edit.altered.as_deref(), Some("carla"));
+        assert!(!edit.can_login);
+        assert!(!edit.superuser);
+        let super_row = UserRow {
+            name: "admin".into(),
+            host: None,
+            detail: "super".into(),
+        };
+        let su = UserEdit::alter(&super_row);
+        assert!(su.can_login);
+        assert!(su.superuser);
     }
 }
 
