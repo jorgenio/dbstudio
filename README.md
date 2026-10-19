@@ -39,6 +39,10 @@ almacén de claves del sistema (keyring).
 - **Respaldar SQL**: dump de una tabla (`DROP TABLE IF EXISTS` + `CREATE
   TABLE` + `INSERT` multi-fila en lotes) a un `.sql` elegido en diálogo
   nativo, con todos los datos.
+- **Gestión de usuarios**: listado de cuentas desde el menú contextual de la
+  conexión (MySQL/MariaDB, PostgreSQL, SQL Server) y formulario de
+  crear/modificar/eliminar con el DDL generado en vista previa antes de
+  ejecutarlo (mutaciones v1: MySQL y PostgreSQL).
 - **Auto-refresh del resultado**: intervalo de 1/5/10/30 s en la pestaña de
   resultados; solo re-ejecuta sentencias de lectura (SELECT/WITH/SHOW/PRAGMA)
   y se detiene mientras hay un overlay o el grid en edición.
@@ -108,8 +112,9 @@ Compila en release y genera `dist/jorgenio-dbstudio-<versión>-win64.zip`
 
 ## Estado y hoja de ruta
 
-Completado hasta el hito **m19** (respaldo/dump SQL de tablas). Pendientes:
-gestión de usuarios y roles, empaquetado para Linux y soporte de Oracle.
+Completado hasta el hito **m20** (gestión de usuarios). Pendientes:
+historial de consultas y guardar/abrir `.sql` en el editor (m21), empaquetado
+para Linux y soporte de Oracle.
 
 ## Licencia
 
