@@ -313,19 +313,32 @@ pub fn insert_statements(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let tuples: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = pairs
+                .iter()
+                .map(|&(file, target)| {
+                    let raw = row.get(file).map(String::as_str).unwrap_or("");
+                    cell_literal(engine, columns[target].data_type.family, raw)
+                })
+                .collect();
+            format!("({})", values.join(", "))
+        })
+        .collect();
+    Ok(batches(&from, &col_list, tuples))
+}
+
+/// Multi-row INSERT statements from pre-literalized tuples, split so no
+/// statement exceeds 200 rows or ~60 KB of VALUES.
+fn batches(from: &str, col_list: &str, tuples: Vec<String>) -> Vec<String> {
     const BATCH_ROWS: usize = 200;
     const BATCH_BYTES: usize = 60_000;
     let mut stmts: Vec<String> = Vec::new();
     let mut batch: Vec<String> = Vec::new();
     let mut batch_bytes = 0usize;
 
-    for row in rows {
-        let mut values = Vec::with_capacity(pairs.len());
-        for &(file, target) in &pairs {
-            let raw = row.get(file).map(String::as_str).unwrap_or("");
-            values.push(cell_literal(engine, columns[target].data_type.family, raw));
-        }
-        let tuple = format!("({})", values.join(", "));
+    for tuple in tuples {
         if !batch.is_empty()
             && (batch.len() >= BATCH_ROWS || batch_bytes + tuple.len() > BATCH_BYTES)
         {
@@ -345,7 +358,25 @@ pub fn insert_statements(
             batch.join(", ")
         ));
     }
-    Ok(stmts)
+    stmts
+}
+
+/// Batch INSERTs for a **full-width, ordered** row set whose values are
+/// already SQL literals (the SQL dump path): driver `CellValue`s keep NULL
+/// distinct from blank text, which the CSV raw-string path cannot express.
+pub fn insert_all_batches(
+    engine: Engine,
+    source: &ObjectRef,
+    columns: &[ColumnMeta],
+    tuples: Vec<String>,
+) -> Vec<String> {
+    let from = table_ref(engine, source);
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(&c.name, engine))
+        .collect::<Vec<_>>()
+        .join(", ");
+    batches(&from, &col_list, tuples)
 }
 
 /// Literal for one raw cell: blanks are `NULL` for non-text families (and

@@ -351,6 +351,10 @@ enum Message {
     AutoSet(RefreshEvery),
     /// Auto-refresh timer fired: re-run the active editor's read-only SQL.
     AutoTick,
+    /// Respaldo SQL: el diálogo de guardado devolvió destino (o canceló).
+    DumpTo(ObjectRef, Option<std::path::PathBuf>),
+    /// Respaldo terminado: ruta escrita y filas volcadas, o error.
+    DumpDone(Result<(String, usize), String>),
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -376,6 +380,8 @@ enum ContextAct {
     Design,
     /// Open the import wizard for a table (CSV/TSV/JSON → INSERT).
     ImportData,
+    /// Open the save dialog for a SQL dump (DROP + CREATE + INSERT).
+    DumpData,
     /// New table under a database/schema (or from a connection row).
     NewTable,
     /// Force a fresh children listing (connection root or node).
@@ -1311,6 +1317,47 @@ fn data_apply_task(
     )
 }
 
+/// Describe the dump target, read **every** row and write the SQL script to
+/// `path`. `Ok((ruta, filas))`; the read is bounded only by memory — the
+/// drivers cap on their streaming loop (`max_rows`), not in the SQL.
+fn dump_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    engine: Engine,
+    table: ObjectRef,
+    path: std::path::PathBuf,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                let detail = client
+                    .describe_table(&table)
+                    .await
+                    .map_err(|e| format!("no se pudo describir la tabla: {e}"))?;
+                let select = format!("SELECT * FROM {}", table_ref(engine, &table));
+                let result = client
+                    .execute(ExecuteRequest::new(select).with_max_rows(usize::MAX))
+                    .await
+                    .map_err(|e| format!("no se pudieron leer las filas: {e}"))?;
+                let text = dump_text(engine, &table, &detail, &result.rows)?;
+                let display = path.display().to_string();
+                let rows = result.rows.len();
+                let shown = display.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::write(&path, text)
+                        .map_err(|e| format!("no se pudo escribir «{shown}»: {e}"))
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                Ok::<(String, usize), String>((display, rows))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::DumpDone,
+    )
+}
+
 /// Run the designer's DDL statements sequentially; `Ok(n)` counts the ones
 /// that completed before any failure stopped the batch.
 fn design_apply_task(
@@ -1714,6 +1761,42 @@ impl App {
                             return Task::none();
                         }
                         self.import_start(obj)
+                    }
+                    ContextAct::DumpData => {
+                        let MenuTarget::Node(obj, kind) = menu.target else {
+                            return Task::none();
+                        };
+                        if kind != ObjectKind::Table {
+                            return Task::none();
+                        }
+                        if self.engine_of(obj.connection) == Engine::Mongodb {
+                            self.status =
+                                "MongoDB no usa SQL: el respaldo aplica solo a motores SQL"
+                                    .to_string();
+                            return Task::none();
+                        }
+                        let file = format!(
+                            "{}.sql",
+                            obj.path.last().map(String::as_str).unwrap_or("respaldo")
+                        );
+                        let (tx, rx) =
+                            tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+                        std::thread::spawn(move || {
+                            let mut dialog = rfd::FileDialog::new()
+                                .set_file_name(file.as_str())
+                                .add_filter("SQL", &["sql"]);
+                            if let Some(docs) = dirs::document_dir() {
+                                dialog = dialog.set_directory(docs);
+                            }
+                            let _ = tx.send(dialog.save_file());
+                        });
+                        Task::perform(
+                            async move {
+                                let path = rx.await.unwrap_or(None);
+                                (obj, path)
+                            },
+                            |(table, path)| Message::DumpTo(table, path),
+                        )
                     }
                     ContextAct::NewTable => match &menu.target {
                         MenuTarget::Node(obj, kind)
@@ -2486,6 +2569,40 @@ impl App {
                 // data_pending is never armed here: the auto path must not
                 // (re)open the data-edit strip behind the user.
                 execute_task(self.rt.clone(), client, req, self.active_tab)
+            }
+            Message::DumpTo(table, Some(path)) => {
+                let engine = self.engine_of(table.connection);
+                if engine == Engine::Mongodb {
+                    self.status =
+                        "MongoDB no usa SQL: el respaldo aplica solo a motores SQL"
+                            .to_string();
+                    return Task::none();
+                }
+                let Some(session) = self.sessions.get(&table.connection) else {
+                    self.status =
+                        "la conexión no está activa — selecciónala de nuevo".to_string();
+                    return Task::none();
+                };
+                self.status = "respaldando…".to_string();
+                dump_task(
+                    self.rt.clone(),
+                    session.client.clone(),
+                    engine,
+                    table,
+                    path,
+                )
+            }
+            Message::DumpTo(_, None) => {
+                self.status = "respaldo cancelado".to_string();
+                Task::none()
+            }
+            Message::DumpDone(Ok((ruta, n))) => {
+                self.status = format!("✓ respaldo escrito: {ruta} ({n} filas)");
+                Task::none()
+            }
+            Message::DumpDone(Err(e)) => {
+                self.status = format!("respaldo falló: {e}");
+                Task::none()
             }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
@@ -5407,6 +5524,48 @@ fn edit_statements(engine: Engine, edit: &DataEditState) -> Vec<String> {
     out
 }
 
+/// Full SQL dump for `table`: header comment, `DROP TABLE IF EXISTS` +
+/// `CREATE TABLE` (designer DDL) and multi-row `INSERT` batches through the
+/// import machinery with an identity mapping (every column, in order).
+fn dump_text(
+    engine: Engine,
+    table: &ObjectRef,
+    detail: &drivers::TableDetail,
+    rows: &[Vec<CellValue>],
+) -> Result<String, String> {
+    let label = table.path.join(".");
+    let mut out = String::new();
+    out.push_str(&format!("-- jorgenio dbstudio: respaldo de {label}\n"));
+    let schema = designer::DesignerState::dump_schema(
+        engine,
+        table.connection,
+        table.clone(),
+        detail.clone(),
+    );
+    if !schema.contains("CREATE TABLE") {
+        return Err(format!("no se pudo generar el esquema de «{label}»"));
+    }
+    out.push_str(&schema);
+    out.push('\n');
+    let tuples: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = (0..detail.columns.len())
+                .map(|i| {
+                    let cell = row.get(i).unwrap_or(&CellValue::Null);
+                    cell_literal(engine, detail.columns[i].data_type.family, cell)
+                })
+                .collect();
+            format!("({})", values.join(", "))
+        })
+        .collect();
+    for stmt in import::insert_all_batches(engine, table, &detail.columns, tuples) {
+        out.push_str(&stmt);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// One labeled field of the data-edit form: name (+PK dot, dirty bullet)
 /// over a value input and a NULL toggle. `disabled` locks blobs (they
 /// cannot round-trip through the text form).
@@ -5610,6 +5769,11 @@ fn context_menu_view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Mes
                             icons::Icon::Import,
                             "Importar datos…",
                             ContextAct::ImportData,
+                        ));
+                        body = body.push(menu_item(
+                            icons::Icon::Save,
+                            "Respaldar SQL…",
+                            ContextAct::DumpData,
                         ));
                     }
                     body = body
@@ -6676,6 +6840,37 @@ mod tests {
         assert_eq!(RefreshEvery::Sec10.to_string(), "10 s");
         assert_eq!(RefreshEvery::ALL.len(), 5);
         assert_eq!(RefreshEvery::ALL[0], RefreshEvery::Off);
+    }
+
+    #[test]
+    fn dump_text_emits_drop_create_and_batched_inserts() {
+        let table = obj(&["demo.db", "pedidos"]);
+        let detail = drivers::TableDetail {
+            columns: vec![
+                dcol("id", TypeFamily::Int),
+                dcol("nombre", TypeFamily::Text),
+            ],
+            primary_keys: vec!["id".into()],
+            foreign_keys: Vec::new(),
+        };
+        let rows = vec![
+            vec![CellValue::Int(1), CellValue::Text("ana".into())],
+            vec![CellValue::Int(2), CellValue::Null],
+        ];
+        let text = dump_text(Engine::Sqlite, &table, &detail, &rows).expect("dump");
+        assert!(text.starts_with("-- jorgenio dbstudio: respaldo de demo.db.pedidos"));
+        assert!(text.contains("DROP TABLE IF EXISTS"));
+        assert!(text.contains("CREATE TABLE"));
+        assert!(text.contains("PRIMARY KEY"));
+        // Identity mapping: every column, in order, values literal-typed
+        // (numbers unquoted, text quoted, NULL for blank non-text).
+        assert!(text.contains("INSERT INTO"));
+        assert!(text.contains("(1, 'ana'), (2, NULL)"));
+        assert!(!text.contains("'1'"));
+        // No rows: schema-only script.
+        let empty = dump_text(Engine::Sqlite, &table, &detail, &[]).expect("schema");
+        assert!(empty.contains("CREATE TABLE"));
+        assert!(!empty.contains("INSERT INTO"));
     }
 }
 

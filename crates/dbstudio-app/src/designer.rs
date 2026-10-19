@@ -107,6 +107,25 @@ impl DesignerState {
         }
     }
 
+    /// `DROP TABLE IF EXISTS` + `CREATE TABLE` for a SQL dump of an existing
+    /// table: seeded from `describe_table` but with no diff baseline, so
+    /// `preview` emits a plain CREATE instead of an ALTER diff.
+    pub fn dump_schema(
+        engine: Engine,
+        connection: ConnectionId,
+        table: ObjectRef,
+        detail: dbstudio_drivers::TableDetail,
+    ) -> String {
+        let mut state = Self::from_table(connection, table, detail);
+        state.existing = None;
+        let name = qualified(engine, &state.parent, &state.name);
+        let create = preview(engine, &state)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        format!("DROP TABLE IF EXISTS {name};\n{create}")
+    }
+
     /// Document that diffs a desired `source` structure against the
     /// `target` currently stored at `table` (`None` = target table is
     /// missing, so the source is created from scratch). Used by `sync`.
