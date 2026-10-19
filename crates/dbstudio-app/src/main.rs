@@ -153,6 +153,10 @@ struct App {
     auto_refresh: RefreshEvery,
     /// Users/roles overlay (listing + DDL form), when open.
     users: Option<UsersState>,
+    /// Executed statements, newest first (persisted to `history.json`).
+    history: Vec<store::HistoryEntry>,
+    /// Query-history overlay, when open.
+    history_panel: Option<HistoryPanel>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -372,6 +376,29 @@ enum Message {
     UsersToggleSuper,
     UsersRun,
     UsersApplied(Result<String, String>),
+    /// Open the save dialog for the current editor content.
+    EditorSave,
+    /// Save dialog answered; `None` = cancelled.
+    EditorSaveTo(Option<std::path::PathBuf>),
+    /// Background write of the editor content finished.
+    EditorSaved(Result<String, String>),
+    /// Open the file picker for a `.sql` file.
+    EditorOpen,
+    /// File picker answered; `None` = cancelled.
+    EditorOpenTo(Option<std::path::PathBuf>),
+    /// Background read finished: display path + file content.
+    EditorOpened(Result<(String, String), String>),
+    /// Show the query-history overlay.
+    HistoryOpen,
+    HistoryClose,
+    /// Substring filter typed in the history strip.
+    HistoryFilter(String),
+    /// Load entry (index into `App::history`) into the editor.
+    HistoryPick(usize),
+    /// Ask before wiping the whole history.
+    HistoryClearAsk,
+    HistoryClearNo,
+    HistoryClearYes,
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -643,6 +670,50 @@ fn auto_refreshable(sql: &str) -> bool {
         first.as_str(),
         "SELECT" | "WITH" | "SHOW" | "PRAGMA" | "EXPLAIN" | "DESCRIBE"
     )
+}
+
+/// Query-history overlay state: substring filter + delete confirmation.
+#[derive(Clone, Debug)]
+struct HistoryPanel {
+    filter: String,
+    clear_confirm: bool,
+}
+
+/// Insert `sql` at the head of the history (duplicates move up, blank
+/// input is ignored) and trim the tail to [`store::HISTORY_CAP`].
+fn history_push(entries: &mut Vec<store::HistoryEntry>, sql: String, conn: Option<String>) {
+    if sql.trim().is_empty() {
+        return;
+    }
+    let when = chrono::Local::now().format("%d/%m %H:%M").to_string();
+    if let Some(pos) = entries.iter().position(|e| e.sql == sql) {
+        let mut entry = entries.remove(pos);
+        entry.conn = conn;
+        entry.when = when;
+        entries.insert(0, entry);
+        return;
+    }
+    entries.insert(
+        0,
+        store::HistoryEntry {
+            sql,
+            conn,
+            when,
+        },
+    );
+    entries.truncate(store::HISTORY_CAP);
+}
+
+/// One-line preview for the history rows: whitespace collapsed, the tail
+/// cut past 120 chars.
+fn history_line(sql: &str) -> String {
+    const MAX: usize = 120;
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > MAX {
+        flat.chars().take(MAX).collect::<String>() + "…"
+    } else {
+        flat
+    }
 }
 
 /// Account listing row: `name` is the account, `host` exists only on
@@ -1042,6 +1113,8 @@ fn boot() -> (App, Task<Message>) {
             import: None,
             auto_refresh: RefreshEvery::Off,
             users: None,
+            history: store::load_history(),
+            history_panel: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -2980,6 +3053,138 @@ impl App {
                     }
                 }
             }
+            Message::EditorSave => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+                std::thread::spawn(move || {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_file_name("consulta.sql")
+                        .add_filter("SQL", &["sql"]);
+                    if let Some(docs) = dirs::document_dir() {
+                        dialog = dialog.set_directory(docs);
+                    }
+                    let _ = tx.send(dialog.save_file());
+                });
+                Task::perform(async move { rx.await.unwrap_or(None) }, Message::EditorSaveTo)
+            }
+            Message::EditorSaveTo(Some(path)) => {
+                let sql = self.editor.content();
+                let display = path.display().to_string();
+                let shown = display.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::write(&path, sql)
+                                .map_err(|e| format!("no se pudo escribir «{shown}»: {e}"))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map(|()| display)
+                    },
+                    Message::EditorSaved,
+                )
+            }
+            Message::EditorSaveTo(None) => {
+                self.status = "guardado cancelado".to_string();
+                Task::none()
+            }
+            Message::EditorSaved(Ok(ruta)) => {
+                self.status = format!("✓ guardado: {ruta}");
+                Task::none()
+            }
+            Message::EditorSaved(Err(e)) => {
+                self.status = format!("error: {e}");
+                Task::none()
+            }
+            Message::EditorOpen => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+                std::thread::spawn(move || {
+                    let mut dialog = rfd::FileDialog::new().add_filter("SQL", &["sql", "txt"]);
+                    if let Some(docs) = dirs::document_dir() {
+                        dialog = dialog.set_directory(docs);
+                    }
+                    let _ = tx.send(dialog.pick_file());
+                });
+                Task::perform(async move { rx.await.unwrap_or(None) }, Message::EditorOpenTo)
+            }
+            Message::EditorOpenTo(Some(path)) => {
+                let display = path.display().to_string();
+                let shown = display.clone();
+                self.status = "leyendo…".to_string();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::read_to_string(&path)
+                                .map_err(|e| format!("no se pudo leer «{shown}»: {e}"))
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map(|content| (display, content))
+                    },
+                    Message::EditorOpened,
+                )
+            }
+            Message::EditorOpenTo(None) => {
+                self.status = "apertura cancelada".to_string();
+                Task::none()
+            }
+            Message::EditorOpened(Ok((ruta, content))) => {
+                self.status = format!("✓ abierto: {ruta}");
+                let task = self.editor.reset(&content).map(Message::Editor);
+                self.stash_tab();
+                task
+            }
+            Message::EditorOpened(Err(e)) => {
+                self.status = format!("error: {e}");
+                Task::none()
+            }
+            Message::HistoryOpen => {
+                self.history_panel = Some(HistoryPanel {
+                    filter: String::new(),
+                    clear_confirm: false,
+                });
+                Task::none()
+            }
+            Message::HistoryClose => {
+                self.history_panel = None;
+                Task::none()
+            }
+            Message::HistoryFilter(s) => {
+                if let Some(panel) = &mut self.history_panel {
+                    panel.filter = s;
+                }
+                Task::none()
+            }
+            Message::HistoryPick(i) => {
+                let Some(entry) = self.history.get(i).cloned() else {
+                    return Task::none();
+                };
+                self.history_panel = None;
+                self.status = "SQL cargado en el editor".to_string();
+                let task = self.editor.reset(&entry.sql).map(Message::Editor);
+                self.stash_tab();
+                task
+            }
+            Message::HistoryClearAsk => {
+                if let Some(panel) = &mut self.history_panel {
+                    panel.clear_confirm = true;
+                }
+                Task::none()
+            }
+            Message::HistoryClearNo => {
+                if let Some(panel) = &mut self.history_panel {
+                    panel.clear_confirm = false;
+                }
+                Task::none()
+            }
+            Message::HistoryClearYes => {
+                self.history.clear();
+                store::save_history(&self.history);
+                if let Some(panel) = &mut self.history_panel {
+                    panel.clear_confirm = false;
+                }
+                self.status = "historial borrado".to_string();
+                Task::none()
+            }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -3062,11 +3267,19 @@ impl App {
                     self.status = "la conexión no está activa — selecciónala de nuevo".to_string();
                     return Task::none();
                 };
+                let client = session.client.clone();
                 let sql = self.editor.content();
                 if sql.trim().is_empty() {
                     self.status = "el editor está vacío".to_string();
                     return Task::none();
                 }
+                // The history records every statement launched from Run/F5.
+                let conn_name = self
+                    .entries
+                    .iter()
+                    .find(|e| e.cfg.id == id)
+                    .map(|e| e.cfg.name.clone());
+                self.history_push(sql.clone(), conn_name);
                 // Data editing arms only for the exact SELECT generated for
                 // a table (a hand-edited SQL stays read-only).
                 let data_obj = match self.selected_object.as_ref() {
@@ -3078,7 +3291,6 @@ impl App {
                     _ => None,
                 };
                 self.data_pending = data_obj;
-                let client = session.client.clone();
                 self.status = "ejecutando…".to_string();
                 let mut req = ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
                 req.context = self.query_context.clone();
@@ -5055,6 +5267,119 @@ impl App {
             .into()
     }
 
+    /// Record the statement launched from Run/F5 and persist the history.
+    fn history_push(&mut self, sql: String, conn: Option<String>) {
+        history_push(&mut self.history, sql, conn);
+        store::save_history(&self.history);
+    }
+
+    /// Query-history overlay: filterable list of executed statements with
+    /// "Cargar" (into the editor) and a wipe action.
+    fn history_view<'a>(&'a self, panel: &'a HistoryPanel) -> Element<'a, Message> {
+        let clear: Element<'_, Message> = if panel.clear_confirm {
+            row![
+                text("¿Borrar todo?").size(12),
+                button(text("Sí, borrar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::HistoryClearYes),
+                button(text("No").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::HistoryClearNo),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            button(text("Limpiar…").size(12))
+                .padding([4.0, 8.0])
+                .style(theme::flat)
+                .on_press_maybe((!self.history.is_empty()).then_some(Message::HistoryClearAsk))
+                .into()
+        };
+
+        let strip = container(
+            row![
+                text("  Historial").size(13),
+                text(format!("{} entrada(s)", self.history.len()))
+                    .size(11)
+                    .color(theme::muted()),
+                Space::new().width(Length::Fill),
+                text_input("filtrar SQL…", &panel.filter)
+                    .on_input(|v| Message::HistoryFilter(v))
+                    .size(12)
+                    .width(200.0),
+                clear,
+                button(text("✕ Cerrar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press(Message::HistoryClose),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 6.0,
+            left: 6.0,
+        })
+        .style(theme::chrome);
+
+        let filter = panel.filter.trim().to_lowercase();
+        let mut body = Column::new().spacing(4);
+        if self.history.is_empty() {
+            body = body.push(
+                text("aún no hay consultas ejecutadas (F5 o «Ejecutar»)")
+                    .size(12)
+                    .color(theme::muted()),
+            );
+        } else {
+            let mut shown = 0;
+            for (i, entry) in self.history.iter().enumerate() {
+                if !filter.is_empty() && !entry.sql.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                shown += 1;
+                body = body.push(
+                    container(
+                        row![
+                            container(text(entry.when.as_str()).size(11).color(theme::muted()))
+                                .width(86.0),
+                            container(
+                                text(entry.conn.as_deref().unwrap_or("—"))
+                                    .size(11)
+                                    .color(theme::muted())
+                            )
+                            .width(130.0),
+                            text(history_line(&entry.sql)).size(12),
+                            Space::new().width(Length::Fill),
+                            button(text("Cargar").size(12))
+                                .padding([2.0, 6.0])
+                                .style(theme::flat)
+                                .on_press(Message::HistoryPick(i)),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([3.0, 4.0]),
+                );
+            }
+            if shown == 0 {
+                body = body.push(text("sin coincidencias…").size(12).color(theme::muted()));
+            }
+        }
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(scrollable(container(body).padding(10)).height(Length::Fill))
+            .width(Length::Fill)
+            .into()
+    }
+
     /// Open the import wizard for a table: installs the state, reads the
     /// table's columns and opens the native file dialog.
     fn import_start(&mut self, table: ObjectRef) -> Task<Message> {
@@ -5629,6 +5954,37 @@ impl App {
                 .style(theme::flat)
                 .on_press(Message::NewTab),
         );
+        tab_row = tab_row.push(Space::new().width(Length::Fill));
+        tab_row = tab_row.push(
+            button(
+                row![icons::svg(icons::Icon::Open, 12.0), text(" Abrir…").size(12)]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(theme::flat)
+            .padding([3.0, 8.0])
+            .on_press(Message::EditorOpen),
+        );
+        tab_row = tab_row.push(
+            button(
+                row![icons::svg(icons::Icon::Save, 12.0), text(" Guardar…").size(12)]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(theme::flat)
+            .padding([3.0, 8.0])
+            .on_press(Message::EditorSave),
+        );
+        tab_row = tab_row.push(
+            button(
+                row![icons::svg(icons::Icon::Query, 12.0), text(" Historial").size(12)]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(theme::flat)
+            .padding([3.0, 8.0])
+            .on_press(Message::HistoryOpen),
+        );
         let editor_tabs = container(tab_row)
             .width(Length::Fill)
             .padding(iced::Padding { top: 6.0, right: 6.0, bottom: 0.0, left: 6.0 })
@@ -5700,25 +6056,27 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        // The import/sync/designer/ER/objects overlays replace the editor +
-        // results while open (highest priority: the import wizard, lowest:
+        // The users/history/import/sync/designer/ER/objects overlays replace
+        // the editor + results while open (highest priority: users, lowest:
         // the objects panel).
         let center: Element<'_, Message> =
             match (
                 &self.users,
+                &self.history_panel,
                 &self.import,
                 &self.sync,
                 &self.designer,
                 &self.er,
                 &self.objects,
             ) {
-                (Some(u), _, _, _, _, _) => self.users_view(u),
-                (None, Some(imp), _, _, _, _) => self.import_view(imp),
-                (None, None, Some(s), _, _, _) => self.sync_view(s),
-                (None, None, None, Some(d), _, _) => self.designer_view(d),
-                (None, None, None, None, Some(er), _) => self.er_view(er),
-                (None, None, None, None, None, Some(o)) => self.objects_view(o),
-                (None, None, None, None, None, None) => {
+                (Some(u), _, _, _, _, _, _) => self.users_view(u),
+                (None, Some(h), _, _, _, _, _) => self.history_view(h),
+                (None, None, Some(imp), _, _, _, _) => self.import_view(imp),
+                (None, None, None, Some(s), _, _, _) => self.sync_view(s),
+                (None, None, None, None, Some(d), _, _) => self.designer_view(d),
+                (None, None, None, None, None, Some(er), _) => self.er_view(er),
+                (None, None, None, None, None, None, Some(o)) => self.objects_view(o),
+                (None, None, None, None, None, None, None) => {
                     let mut col = Column::new()
                         .push(editor_tabs)
                         .push(editor.height(Length::FillPortion(2)))
@@ -5844,6 +6202,18 @@ impl App {
                     if control && !modifiers.shift() && c.as_ref() == " " =>
                 {
                     Some(Message::CompletionTrigger)
+                }
+                // Ctrl+S / Ctrl+O save/open the editor file (the editor
+                // doesn't claim them, so they reach the global listener).
+                iced::keyboard::Key::Character(ref c)
+                    if control && !modifiers.shift() && c.as_ref() == "s" =>
+                {
+                    Some(Message::EditorSave)
+                }
+                iced::keyboard::Key::Character(ref c)
+                    if control && !modifiers.shift() && c.as_ref() == "o" =>
+                {
+                    Some(Message::EditorOpen)
                 }
                 // Esc closes the popup (same reasoning as F5: declined by the
                 // editor, seen here when the popup is open).
@@ -7828,6 +8198,42 @@ mod tests {
         let su = UserEdit::alter(&super_row);
         assert!(su.can_login);
         assert!(su.superuser);
+    }
+
+    #[test]
+    fn history_push_dedupes_moves_to_front_and_caps() {
+        let mut entries = Vec::new();
+        history_push(&mut entries, "   ".into(), None);
+        assert!(entries.is_empty(), "blank statements never record");
+
+        history_push(&mut entries, "SELECT 1".into(), Some("demo".into()));
+        history_push(&mut entries, "SELECT 2".into(), None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sql, "SELECT 2");
+
+        // Repeat → moves to the head with the fresh connection, no dup.
+        history_push(&mut entries, "SELECT 1".into(), Some("prod".into()));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sql, "SELECT 1");
+        assert_eq!(entries[0].conn.as_deref(), Some("prod"));
+
+        // Cap: the oldest statements fall off the tail.
+        for i in 0..(store::HISTORY_CAP + 10) {
+            history_push(&mut entries, format!("SELECT {i}"), None);
+        }
+        assert_eq!(entries.len(), store::HISTORY_CAP);
+        assert_eq!(
+            entries[0].sql,
+            format!("SELECT {}", store::HISTORY_CAP + 9)
+        );
+    }
+
+    #[test]
+    fn history_line_collapses_whitespace_and_truncates() {
+        assert_eq!(history_line("  SELECT  *\n FROM t "), "SELECT * FROM t");
+        let long = history_line(&"SELECT ".repeat(60));
+        assert!(long.chars().count() <= 121, "preview must stay one row");
+        assert!(long.ends_with('…'));
     }
 }
 

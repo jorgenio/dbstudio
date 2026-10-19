@@ -50,6 +50,61 @@ pub fn save_settings_to(path: &std::path::Path, settings: &Settings) {
     let _ = std::fs::write(path, json);
 }
 
+/// One executed statement kept for reuse: newest first in `history.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub sql: String,
+    /// Connection name at execution time (display only).
+    #[serde(default)]
+    pub conn: Option<String>,
+    /// Local stamp `dd/MM HH:MM` recorded when the statement ran.
+    #[serde(default)]
+    pub when: String,
+}
+
+/// Statements kept on disk; older ones fall off the tail.
+pub const HISTORY_CAP: usize = 300;
+
+fn history_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("dbstudio")
+        .join("history.json")
+}
+
+/// Load the query history; a missing or corrupt file reads as empty.
+pub fn load_history() -> Vec<HistoryEntry> {
+    load_history_from(&history_path())
+}
+
+/// Persist the history (best-effort; callers may ignore errors).
+pub fn save_history(entries: &[HistoryEntry]) {
+    save_history_to(&history_path(), entries);
+}
+
+/// Same as [`load_history`] but from an explicit path (tests).
+pub fn load_history_from(path: &std::path::Path) -> Vec<HistoryEntry> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<HistoryEntry>>(&s).ok())
+        .map(|mut v| {
+            v.truncate(HISTORY_CAP);
+            v
+        })
+        .unwrap_or_default()
+}
+
+/// Same as [`save_history`] but to an explicit path (tests).
+pub fn save_history_to(path: &std::path::Path, entries: &[HistoryEntry]) {
+    let Ok(json) = serde_json::to_string_pretty(entries) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
 pub struct Connections {
     path: PathBuf,
     secrets: SecretStore,
@@ -237,6 +292,48 @@ mod tests {
         // Corrupt file → defaults again, no panic.
         std::fs::write(&path, "{not json").unwrap();
         assert!(!load_settings_from(&path).theme_dark);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_roundtrips_trims_cap_and_reads_corrupt_as_empty() {
+        let path =
+            std::env::temp_dir().join(format!("dbstudio-test-hist-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Missing file → empty history.
+        assert!(load_history_from(&path).is_empty());
+
+        let entries = vec![
+            HistoryEntry {
+                sql: "SELECT 1".into(),
+                conn: Some("demo".into()),
+                when: "01/01 10:00".into(),
+            },
+            HistoryEntry {
+                sql: "SELECT 2".into(),
+                conn: None,
+                when: "01/01 10:01".into(),
+            },
+        ];
+        save_history_to(&path, &entries);
+        assert_eq!(load_history_from(&path), entries);
+
+        // Over-cap file → trimmed on load.
+        let big: Vec<HistoryEntry> = (0..HISTORY_CAP + 7)
+            .map(|i| HistoryEntry {
+                sql: format!("SELECT {i}"),
+                conn: None,
+                when: String::new(),
+            })
+            .collect();
+        save_history_to(&path, &big);
+        assert_eq!(load_history_from(&path).len(), HISTORY_CAP);
+
+        // Corrupt file → empty again, no panic.
+        std::fs::write(&path, "{nope").unwrap();
+        assert!(load_history_from(&path).is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
