@@ -12,6 +12,7 @@ mod export;
 mod form;
 mod grid;
 mod icons;
+mod import;
 mod store;
 mod sync;
 mod theme;
@@ -25,10 +26,11 @@ use dbstudio_core::{
 };
 use dbstudio_drivers::{self as drivers, Session};
 use form::{ConnForm, FormMsg};
+use import::ImportFormat;
 use store::Connections;
 use iced::widget::{
-    button, checkbox, column, container, row, rule, scrollable, stack, text, text_input, Column,
-    MouseArea, Space,
+    button, checkbox, column, container, pick_list, row, rule, scrollable, stack, text, text_input,
+    Column, MouseArea, Space,
 };
 use iced::{Element, Length, Subscription, Task, Theme};
 use iced_autocomplete::{auto_complete, Filter, State as AutocompleteState};
@@ -145,6 +147,8 @@ struct App {
     /// Object + SQL of the generated SELECT currently running; consumed
     /// when its rows land (`apply_result`) to open the edit strip.
     data_pending: Option<(ObjectRef, String)>,
+    /// Import wizard overlay (CSV/TSV/JSON → batch INSERT), when open.
+    import: Option<ImportState>,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -323,6 +327,24 @@ enum Message {
     DataApplied(ObjectRef, Result<usize, String>),
     /// `describe_table` answered for the data-edit strip (primary keys).
     DataDescribed(ObjectRef, Result<drivers::TableDetail, String>),
+    /// Open the import wizard for a table (native file dialog included).
+    ImportBrowse,
+    /// Native open-file dialog returned a path (None = cancelled).
+    ImportPicked(Option<std::path::PathBuf>),
+    /// Path typed by hand in the wizard.
+    ImportSetPath(String),
+    ImportFormatSel(ImportFormat),
+    ImportDelimiter(char),
+    ImportHeader(bool),
+    /// Re-read + re-parse the file with the current wizard settings.
+    ImportReload,
+    ImportLoaded(Result<import::Parsed, String>),
+    ImportDescribed(ObjectRef, Result<drivers::TableDetail, String>),
+    /// Mapping row changed: file column → target column (None = skip).
+    ImportMap(usize, Option<usize>),
+    ImportRun,
+    ImportDone(Result<usize, String>),
+    ImportClose,
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -346,6 +368,8 @@ enum ContextAct {
     Open,
     /// Open the table designer for a table.
     Design,
+    /// Open the import wizard for a table (CSV/TSV/JSON → INSERT).
+    ImportData,
     /// New table under a database/schema (or from a connection row).
     NewTable,
     /// Force a fresh children listing (connection root or node).
@@ -371,6 +395,8 @@ enum ObjectsAction {
     NewTable,
     /// Open the designer for the selected table row.
     Design,
+    /// Open the import wizard for the selected table row.
+    Import,
     /// Arm the two-step delete for the selected table/view row.
     Delete,
     /// Run the DROP armed by `Delete`.
@@ -395,6 +421,107 @@ struct ObjectsState {
     /// Destructive delete confirmation showing.
     confirm: bool,
 }
+
+/// Import wizard overlay: reads a CSV/TSV/JSON file, maps its columns onto
+/// an existing table and batch-inserts the rows (m17).
+struct ImportState {
+    /// Target table (SQL engines only).
+    table: ObjectRef,
+    /// Connection owning the table (session for describe + insert).
+    connection: ConnectionId,
+    /// Target columns from `describe_table`.
+    columns: Vec<ColumnMeta>,
+    /// `describe_table` still in flight.
+    loading: bool,
+    /// File path (picked with the dialog or typed by hand).
+    path: String,
+    format: ImportFormat,
+    /// CSV delimiter (TSV forces tab, JSON ignores it).
+    delimiter: char,
+    /// First row holds column names (CSV/TSV only).
+    header: bool,
+    /// File's column names (header row or generated `colN`).
+    file_columns: Vec<String>,
+    /// Parsed raw rows.
+    rows: Vec<Vec<String>>,
+    /// Target column per file column (`None` = skip).
+    mapping: Vec<Option<usize>>,
+    /// Last parse error (red banner inside the wizard).
+    error: Option<String>,
+    /// Insert batch in flight.
+    running: bool,
+}
+
+impl ImportState {
+    fn new(table: ObjectRef, connection: ConnectionId) -> Self {
+        Self {
+            table,
+            connection,
+            columns: Vec::new(),
+            loading: true,
+            path: String::new(),
+            format: ImportFormat::Csv,
+            delimiter: ',',
+            header: true,
+            file_columns: Vec::new(),
+            rows: Vec::new(),
+            mapping: Vec::new(),
+            error: None,
+            running: false,
+        }
+    }
+
+    /// Rebuild the mapping from names (after a file load or the describe).
+    fn remap(&mut self) {
+        self.mapping = import::auto_map(&self.file_columns, &self.columns);
+    }
+
+    fn mapped_count(&self) -> usize {
+        self.mapping.iter().flatten().count()
+    }
+
+    /// First duplicate target column (pre-run validation).
+    fn duplicate_target(&self) -> Option<String> {
+        let mut seen: HashSet<usize> = HashSet::new();
+        for target in self.mapping.iter().flatten() {
+            if !seen.insert(*target) {
+                return Some(format!(
+                    "la columna «{}» está mapeada dos veces",
+                    self.columns.get(*target)?.name
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// One option of a mapping pick-list: target column index + display label.
+#[derive(Clone, PartialEq)]
+struct MapChoice(Option<usize>, String);
+
+impl std::fmt::Display for MapChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+/// Delimiter pick-list entry (a bare `char` would render tab invisibly).
+#[derive(Clone, Copy, PartialEq)]
+struct Delim(char);
+
+impl std::fmt::Display for Delim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            ',' => ", (coma)",
+            ';' => "; (punto y coma)",
+            '\t' => "TAB (tabulador)",
+            '|' => "| (barra)",
+            other => return write!(f, "{other}"),
+        })
+    }
+}
+
+const DELIMS: [Delim; 4] = [Delim(','), Delim(';'), Delim('\t'), Delim('|')];
 
 /// Which navigator row the last left-click hit (time-based double click;
 /// `MouseArea::on_double_click` never fires wrapping a button because the
@@ -680,6 +807,7 @@ fn boot() -> (App, Task<Message>) {
             tree_last_click: None,
             data_edit: None,
             data_pending: None,
+            import: None,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -932,6 +1060,103 @@ fn design_describe_task(
                 (table.connection, table, detail)
             }))
         },
+    )
+}
+
+/// Native open-file dialog for the import wizard: it blocks, so it runs on
+/// its own thread and resumes through a oneshot channel (same pattern as
+/// the export dialog).
+fn import_dialog_task() -> Task<Message> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Datos", &["csv", "tsv", "txt", "json"])
+            .add_filter("CSV", &["csv", "txt"])
+            .add_filter("JSON", &["json"]);
+        if let Some(docs) = dirs::document_dir() {
+            dialog = dialog.set_directory(docs);
+        }
+        let _ = tx.send(dialog.pick_file());
+    });
+    Task::perform(
+        async move { rx.await.unwrap_or(None) },
+        Message::ImportPicked,
+    )
+}
+
+/// Read + parse the chosen file off the UI thread with the wizard settings.
+fn import_load_task(
+    path: String,
+    format: ImportFormat,
+    delimiter: char,
+    header: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("no se pudo leer «{path}»: {e}"))?;
+                import::parse(&text, format, delimiter, header)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::ImportLoaded,
+    )
+}
+
+/// Describe the import target to learn its columns (mapping side).
+fn import_describe_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    table: ObjectRef,
+) -> Task<Message> {
+    let reply = table.clone();
+    Task::perform(
+        async move {
+            let res: Result<_, String> = rt
+                .spawn(async move {
+                    client
+                        .describe_table(&table)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            res
+        },
+        move |res| Message::ImportDescribed(reply.clone(), res),
+    )
+}
+
+/// Run the import INSERT batches sequentially; `Ok(n)` is the number of rows
+/// the batches carried (statement text is truncated in errors: multi-row
+/// VALUES can be tens of KB).
+fn import_apply_task(
+    rt: Arc<tokio::runtime::Runtime>,
+    client: Arc<dyn drivers::DatabaseClient>,
+    stmts: Vec<String>,
+    expected_rows: usize,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            rt.spawn(async move {
+                for stmt in &stmts {
+                    client
+                        .execute(ExecuteRequest::new(stmt))
+                        .await
+                        .map_err(|e| {
+                            let shown: String = stmt.chars().take(240).collect();
+                            let suffix = if stmt.chars().count() > 240 { "…" } else { "" };
+                            format!("{shown}{suffix}\n  → {e}")
+                        })?;
+                }
+                Ok::<usize, String>(expected_rows)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        },
+        Message::ImportDone,
     )
 }
 
@@ -1383,6 +1608,15 @@ impl App {
                         self.selected_object = Some((obj, kind));
                         self.update(Message::DesignSelected)
                     }
+                    ContextAct::ImportData => {
+                        let MenuTarget::Node(obj, kind) = menu.target else {
+                            return Task::none();
+                        };
+                        if kind != ObjectKind::Table {
+                            return Task::none();
+                        }
+                        self.import_start(obj)
+                    }
                     ContextAct::NewTable => match &menu.target {
                         MenuTarget::Node(obj, kind)
                             if matches!(
@@ -1608,6 +1842,15 @@ impl App {
                         self.selected_object =
                             Some((row.object, ObjectKind::Table));
                         self.update(Message::DesignSelected)
+                    }
+                    ObjectsAction::Import => {
+                        let Some(row) = sel_row else {
+                            return Task::none();
+                        };
+                        if row.kind != ObjectKind::Table {
+                            return Task::none();
+                        }
+                        self.import_start(row.object)
                     }
                     ObjectsAction::Delete => {
                         let Some(row) = sel_row else {
@@ -1877,6 +2120,231 @@ impl App {
                 self.data_edit = None;
                 Task::none()
             }
+            // ── import wizard: file, mapping, batch INSERT ───────────────
+            Message::ImportBrowse => import_dialog_task(),
+            Message::ImportPicked(path) => match path {
+                Some(path) => {
+                    let Some(st) = &mut self.import else {
+                        return Task::none();
+                    };
+                    st.path = path.display().to_string();
+                    st.format = ImportFormat::from_path(&path);
+                    st.delimiter = match st.format {
+                        ImportFormat::Tsv => '\t',
+                        ImportFormat::Csv => import::sniff_file(&path).unwrap_or(','),
+                        ImportFormat::Json => ',',
+                    };
+                    st.error = None;
+                    let (path, format, delimiter, header) =
+                        (st.path.clone(), st.format, st.delimiter, st.header);
+                    import_load_task(path, format, delimiter, header)
+                }
+                None => {
+                    // A fresh dialog with no typed path aborts the wizard;
+                    // a hand-typed path survives (the dialog was optional).
+                    if self.import.as_ref().is_some_and(|s| s.path.is_empty()) {
+                        self.import = None;
+                        self.status = "importación cancelada".to_string();
+                    }
+                    Task::none()
+                }
+            },
+            Message::ImportSetPath(v) => {
+                if let Some(st) = &mut self.import {
+                    st.path = v;
+                }
+                Task::none()
+            }
+            Message::ImportFormatSel(f) => {
+                if let Some(st) = &mut self.import {
+                    st.format = f;
+                    if f == ImportFormat::Tsv {
+                        st.delimiter = '\t';
+                    }
+                }
+                self.import_reload()
+            }
+            Message::ImportDelimiter(d) => {
+                if let Some(st) = &mut self.import {
+                    st.delimiter = d;
+                }
+                self.import_reload()
+            }
+            Message::ImportHeader(h) => {
+                if let Some(st) = &mut self.import {
+                    st.header = h;
+                }
+                self.import_reload()
+            }
+            Message::ImportReload => self.import_reload(),
+            Message::ImportLoaded(res) => {
+                let Some(st) = &mut self.import else {
+                    return Task::none();
+                };
+                match res {
+                    Ok(parsed) => {
+                        st.file_columns = parsed.columns;
+                        st.rows = parsed.rows;
+                        st.error = None;
+                        st.remap();
+                        self.status = format!(
+                            "{} filas × {} columnas listas",
+                            st.rows.len(),
+                            st.file_columns.len()
+                        );
+                    }
+                    Err(e) => {
+                        st.file_columns.clear();
+                        st.rows.clear();
+                        st.mapping.clear();
+                        st.error = Some(e.clone());
+                        self.status = format!("error leyendo el fichero: {e}");
+                    }
+                }
+                Task::none()
+            }
+            Message::ImportDescribed(table, res) => {
+                let owns = self.import.as_ref().is_some_and(|s| s.table == table);
+                if !owns {
+                    return Task::none();
+                }
+                match res {
+                    Ok(detail) => {
+                        if let Some(st) = &mut self.import {
+                            st.columns = detail.columns;
+                            st.loading = false;
+                            // File arrived before the columns: build the
+                            // name-based mapping now (nothing user-set yet).
+                            if !st.file_columns.is_empty()
+                                && st.mapping.iter().all(Option::is_none)
+                            {
+                                st.remap();
+                            }
+                        }
+                        Task::none()
+                    }
+                    Err(e) => {
+                        self.import = None;
+                        self.status = format!("no se pudo leer la tabla: {e}");
+                        Task::none()
+                    }
+                }
+            }
+            Message::ImportMap(file_idx, target) => {
+                if let Some(st) = &mut self.import {
+                    if let Some(slot) = st.mapping.get_mut(file_idx) {
+                        if target.is_none_or(|t| t < st.columns.len()) {
+                            *slot = target;
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ImportRun => {
+                let Some(st) = &self.import else {
+                    return Task::none();
+                };
+                if st.loading || st.running || st.error.is_some() {
+                    return Task::none();
+                }
+                if st.rows.is_empty() {
+                    self.status = "no hay filas para importar".to_string();
+                    return Task::none();
+                }
+                if st.mapped_count() == 0 {
+                    self.status = "mapea al menos una columna del fichero".to_string();
+                    return Task::none();
+                }
+                if let Some(dup) = st.duplicate_target() {
+                    self.status = dup;
+                    return Task::none();
+                }
+                let engine = self.engine_of(st.connection);
+                let table = st.table.clone();
+                let connection = st.connection;
+                let expected = st.rows.len();
+                let stmts = match import::insert_statements(
+                    engine,
+                    &st.table,
+                    &st.columns,
+                    &st.mapping,
+                    &st.rows,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.status = format!("error preparando el import: {e}");
+                        return Task::none();
+                    }
+                };
+                if stmts.is_empty() {
+                    self.status = "nada que importar".to_string();
+                    return Task::none();
+                }
+                let Some(session) = self.sessions.get(&connection) else {
+                    self.status = "sin sesión: no se puede importar".to_string();
+                    return Task::none();
+                };
+                let client = session.client.clone();
+                if let Some(st) = &mut self.import {
+                    st.running = true;
+                }
+                let name = table.path.last().cloned().unwrap_or_default();
+                self.status = format!("importando {expected} filas en {name}…");
+                import_apply_task(self.rt.clone(), client, stmts, expected)
+            }
+            Message::ImportDone(res) => {
+                let Some(st) = self.import.as_ref() else {
+                    return Task::none();
+                };
+                let table = st.table.clone();
+                match res {
+                    Ok(n) => {
+                        self.import = None;
+                        let name = table.path.last().cloned().unwrap_or_default();
+                        self.status = format!("✓ {n} filas importadas en {name}");
+                        // Refresh the edit strip when it shows this table.
+                        let refresh = self
+                            .data_edit
+                            .as_ref()
+                            .filter(|e| e.source == table)
+                            .map(|e| e.sql.clone());
+                        match refresh {
+                            Some(sql) => {
+                                self.data_pending = Some((table.clone(), sql.clone()));
+                                match self.sessions.get(&table.connection) {
+                                    Some(session) => {
+                                        let client = session.client.clone();
+                                        let req =
+                                            ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
+                                        execute_task(
+                                            self.rt.clone(),
+                                            client,
+                                            req,
+                                            self.active_tab,
+                                        )
+                                    }
+                                    None => {
+                                        self.data_edit = None;
+                                        Task::none()
+                                    }
+                                }
+                            }
+                            None => Task::none(),
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(st) = &mut self.import {
+                            st.running = false;
+                        }
+                        self.status = format!("error importando: {e}");
+                        Task::none()
+                    }
+                }
+            }
+            Message::ImportClose => {
+                self.import = None;
+                Task::none()
+            }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
                     return Task::none();
@@ -1899,6 +2367,9 @@ impl App {
                 if self.data_edit.as_ref().is_some_and(|e| e.connection == removed.cfg.id) {
                     self.data_edit = None;
                     self.data_pending = None;
+                }
+                if self.import.as_ref().is_some_and(|s| s.connection == removed.cfg.id) {
+                    self.import = None;
                 }
                 if self.design_pending == Some(removed.cfg.id) {
                     self.design_pending = None;
@@ -2952,6 +3423,7 @@ impl App {
         self.sync = None;
         self.sync_pending = None;
         self.objects = None;
+        self.import = None;
         self.data_edit = None;
         self.data_pending = None;
         self.completion.close();
@@ -3407,6 +3879,12 @@ impl App {
                     sql_db && sel.is_some_and(|n| n.kind == ObjectKind::Table),
                 ),
                 act_btn(
+                    icons::Icon::Import,
+                    "Importar",
+                    ObjectsAction::Import,
+                    sql_db && sel.is_some_and(|n| n.kind == ObjectKind::Table),
+                ),
+                act_btn(
                     icons::Icon::Delete,
                     "Eliminar",
                     ObjectsAction::Delete,
@@ -3673,6 +4151,269 @@ impl App {
                 )
                 .into(),
         )
+    }
+
+    /// Open the import wizard for a table: installs the state, reads the
+    /// table's columns and opens the native file dialog.
+    fn import_start(&mut self, table: ObjectRef) -> Task<Message> {
+        let engine = self.engine_of(table.connection);
+        if engine == Engine::Mongodb {
+            self.status = "importar no está disponible en MongoDB".to_string();
+            return Task::none();
+        }
+        let Some(session) = self.sessions.get(&table.connection).cloned() else {
+            self.status = "sin sesión: no se puede importar".to_string();
+            return Task::none();
+        };
+        self.context_menu = None;
+        self.import = Some(ImportState::new(table.clone(), table.connection));
+        let describe =
+            import_describe_task(self.rt.clone(), session.client.clone(), table);
+        Task::batch([describe, import_dialog_task()])
+    }
+
+    /// Re-read + re-parse the file with the current wizard settings.
+    fn import_reload(&mut self) -> Task<Message> {
+        let Some(st) = &self.import else {
+            return Task::none();
+        };
+        let path = st.path.trim().to_string();
+        if path.is_empty() {
+            return Task::none();
+        }
+        let (format, delimiter, header) = (st.format, st.delimiter, st.header);
+        if let Some(st) = &mut self.import {
+            st.error = None;
+            st.rows.clear();
+            st.file_columns.clear();
+            st.mapping.clear();
+        }
+        self.status = "cargando el fichero…".to_string();
+        import_load_task(path, format, delimiter, header)
+    }
+
+    /// Import wizard overlay: file picker, format options, column mapping,
+    /// preview and run (replaces the editor + results while open).
+    fn import_view<'a>(&'a self, st: &'a ImportState) -> Element<'a, Message> {
+        let table = st
+            .table
+            .path
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "tabla".to_string());
+        let red = iced::Color::from_rgb(0.898, 0.325, 0.294);
+
+        // ── header strip ────────────────────────────────────────────────
+        let can_run = !st.loading
+            && !st.running
+            && st.error.is_none()
+            && !st.rows.is_empty()
+            && st.mapped_count() > 0;
+        let strip = container(
+            row![
+                icons::svg(icons::Icon::Import, 16.0),
+                text(format!("Importar en: {table}")).size(13),
+                container(
+                    row![
+                        button(text("✓ Importar").size(12))
+                            .style(theme::solid)
+                            .on_press_maybe(can_run.then_some(Message::ImportRun)),
+                        button(text("✕ Volver").size(12))
+                            .style(theme::flat)
+                            .on_press(Message::ImportClose),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 0.0,
+            left: 6.0,
+        })
+        .style(theme::chrome);
+
+        // ── body: file row, format row, status, mapping, preview ────────
+        let mut body = Column::new().spacing(10);
+
+        body = body.push(
+            row![
+                text("Fichero:").size(11).color(theme::muted()),
+                text_input("ruta/al/fichero.csv", &st.path)
+                    .on_input(Message::ImportSetPath)
+                    .size(12)
+                    .width(Length::Fill),
+                button(text("Examinar…").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press_maybe(
+                        (!st.running).then_some(Message::ImportBrowse),
+                    ),
+                button(text("Cargar").size(12))
+                    .padding([4.0, 8.0])
+                    .style(theme::flat)
+                    .on_press_maybe(
+                        (!st.path.trim().is_empty() && !st.running)
+                            .then_some(Message::ImportReload),
+                    ),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        );
+
+        let mut fmt = row![
+            text("Formato:").size(11).color(theme::muted()),
+            pick_list(
+                ImportFormat::ALL,
+                Some(st.format),
+                Message::ImportFormatSel
+            ),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        if st.format == ImportFormat::Csv {
+            fmt = fmt
+                .push(text("Delimitador:").size(11).color(theme::muted()))
+                .push(pick_list(
+                    DELIMS,
+                    Some(Delim(st.delimiter)),
+                    |d| Message::ImportDelimiter(d.0),
+                ));
+        }
+        if st.format != ImportFormat::Json {
+            fmt = fmt
+                .push(
+                    checkbox(st.header)
+                        .size(13)
+                        .on_toggle(Message::ImportHeader),
+                )
+                .push(text("Primera fila = nombres").size(11));
+        }
+        body = body.push(fmt);
+
+        let status_line: Element<'_, Message> = if let Some(err) = &st.error {
+            text(format!("⚠ {err}")).size(12).color(red).into()
+        } else if st.loading {
+            text("leyendo la estructura de la tabla…")
+                .size(12)
+                .color(theme::muted())
+                .into()
+        } else if st.running {
+            text("importando…").size(12).color(theme::muted()).into()
+        } else if let Some(dup) = st.duplicate_target() {
+            text(format!("⚠ {dup}")).size(12).color(red).into()
+        } else {
+            text(format!(
+                "{} filas × {} columnas · {} mapeada(s)",
+                st.rows.len(),
+                st.file_columns.len(),
+                st.mapped_count()
+            ))
+            .size(12)
+            .color(theme::muted())
+            .into()
+        };
+        body = body.push(status_line);
+
+        if !st.loading && !st.file_columns.is_empty() {
+            let head = row![
+                text("Columna del fichero")
+                    .size(11)
+                    .color(theme::muted())
+                    .width(Length::Fixed(190.0)),
+                Space::new().width(Length::Fixed(24.0)),
+                text("Columna de la tabla")
+                    .size(11)
+                    .color(theme::muted())
+                    .width(Length::Fixed(190.0)),
+                text("Muestra (1ª fila)").size(11).color(theme::muted()),
+            ]
+            .spacing(6);
+            let mut map_list = Column::new().spacing(4).push(head);
+            for (i, file_col) in st.file_columns.iter().enumerate() {
+                let selected = st.mapping.get(i).copied().flatten();
+                let options: Vec<MapChoice> =
+                    std::iter::once(MapChoice(None, "(omitir)".to_string()))
+                        .chain(st.columns.iter().enumerate().map(|(t, c)| {
+                            MapChoice(Some(t), c.name.clone())
+                        }))
+                        .collect();
+                let sel_label = selected
+                    .and_then(|t| st.columns.get(t))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "(omitir)".to_string());
+                let mut sample = st
+                    .rows
+                    .first()
+                    .and_then(|r| r.get(i))
+                    .cloned()
+                    .unwrap_or_default();
+                if sample.chars().count() > 40 {
+                    sample = sample.chars().take(40).collect::<String>() + "…";
+                }
+                map_list = map_list.push(
+                    row![
+                        text(file_col.clone())
+                            .size(12)
+                            .width(Length::Fixed(190.0)),
+                        text("→")
+                            .size(11)
+                            .color(theme::muted())
+                            .width(Length::Fixed(24.0)),
+                        pick_list(
+                            options,
+                            Some(MapChoice(selected, sel_label)),
+                            move |choice| Message::ImportMap(i, choice.0),
+                        )
+                        .width(Length::Fixed(190.0)),
+                        text(sample).size(11).color(theme::muted()),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+            body = body.push(map_list);
+        }
+
+        if !st.rows.is_empty() && st.error.is_none() {
+            body = body.push(text("Vista previa:").size(11).color(theme::muted()));
+            let mut preview = Column::new().spacing(2);
+            for row_vals in st.rows.iter().take(5) {
+                let mut line = row_vals.join(" | ");
+                if line.chars().count() > 160 {
+                    line = line.chars().take(160).collect::<String>() + "…";
+                }
+                preview = preview.push(text(line).size(10).color(theme::muted()));
+            }
+            body = body.push(
+                container(preview)
+                    .padding([6.0, 8.0])
+                    .width(Length::Fill)
+                    .style(theme::workspace),
+            );
+        }
+
+        Column::new()
+            .push(strip)
+            .push(rule::horizontal(1).style(theme::hairline))
+            .push(
+                container(
+                    scrollable(container(body).padding([12.0, 16.0]))
+                        .height(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::workspace),
+            )
+            .width(Length::Fill)
+            .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -4049,15 +4790,17 @@ impl App {
             .height(Length::Fill)
             .style(theme::workspace);
 
-        // The sync/designer/ER/objects overlays replace the editor + results
-        // while open (lowest priority: the objects panel).
+        // The import/sync/designer/ER/objects overlays replace the editor +
+        // results while open (highest priority: the import wizard, lowest:
+        // the objects panel).
         let center: Element<'_, Message> =
-            match (&self.sync, &self.designer, &self.er, &self.objects) {
-                (Some(s), _, _, _) => self.sync_view(s),
-                (None, Some(d), _, _) => self.designer_view(d),
-                (None, None, Some(er), _) => self.er_view(er),
-                (None, None, None, Some(o)) => self.objects_view(o),
-                (None, None, None, None) => {
+            match (&self.import, &self.sync, &self.designer, &self.er, &self.objects) {
+                (Some(imp), _, _, _, _) => self.import_view(imp),
+                (None, Some(s), _, _, _) => self.sync_view(s),
+                (None, None, Some(d), _, _) => self.designer_view(d),
+                (None, None, None, Some(er), _) => self.er_view(er),
+                (None, None, None, None, Some(o)) => self.objects_view(o),
+                (None, None, None, None, None) => {
                     let mut col = Column::new()
                         .push(editor_tabs)
                         .push(editor.height(Length::FillPortion(2)))
@@ -4708,6 +5451,11 @@ fn context_menu_view<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Mes
                             icons::Icon::Design,
                             "Diseñar",
                             ContextAct::Design,
+                        ));
+                        body = body.push(menu_item(
+                            icons::Icon::Import,
+                            "Importar datos…",
+                            ContextAct::ImportData,
                         ));
                     }
                     body = body
@@ -5697,6 +6445,30 @@ mod tests {
         // A table without a resolvable PK yields nothing (install-time guard).
         e.pk = vec!["no_existe".into()];
         assert!(edit_statements(Engine::Sqlite, &e).is_empty());
+    }
+
+    #[test]
+    fn import_state_maps_by_name_and_flags_duplicates() {
+        let mut st = ImportState::new(obj(&["demo.db", "pedidos"]), ConnectionId::nil());
+        st.file_columns = vec![" id ".into(), "NOMBRE".into(), "extra".into()];
+        st.columns = vec![
+            dcol("id", TypeFamily::Int),
+            dcol("nombre", TypeFamily::Text),
+        ];
+        st.loading = false;
+        st.remap();
+        assert_eq!(st.mapped_count(), 2);
+        assert_eq!(st.mapping, vec![Some(0), Some(1), None]);
+        assert!(st.duplicate_target().is_none());
+        // Two file columns pointed at the same target → flagged for Run.
+        st.mapping = vec![Some(0), Some(0), None];
+        assert!(
+            st.duplicate_target()
+                .is_some_and(|d| d.contains("dos veces"))
+        );
+        // Empty mapping blocks the run button (mapped_count == 0).
+        st.mapping = vec![None, None, None];
+        assert_eq!(st.mapped_count(), 0);
     }
 }
 
