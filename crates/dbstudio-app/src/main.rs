@@ -149,6 +149,8 @@ struct App {
     data_pending: Option<(ObjectRef, String)>,
     /// Import wizard overlay (CSV/TSV/JSON → batch INSERT), when open.
     import: Option<ImportState>,
+    /// Auto-refresh interval for the result grid (timer via subscription).
+    auto_refresh: RefreshEvery,
     /// Last object opened from the tree: seeds the designer's target.
     selected_object: Option<(ObjectRef, ObjectKind)>,
     root: Option<ObjectRef>,
@@ -345,6 +347,10 @@ enum Message {
     ImportRun,
     ImportDone(Result<usize, String>),
     ImportClose,
+    /// Auto-refresh interval picked in the result strip.
+    AutoSet(RefreshEvery),
+    /// Auto-refresh timer fired: re-run the active editor's read-only SQL.
+    AutoTick,
 }
 
 /// Right-click menu shown right under a navigator row.
@@ -522,6 +528,97 @@ impl std::fmt::Display for Delim {
 }
 
 const DELIMS: [Delim; 4] = [Delim(','), Delim(';'), Delim('\t'), Delim('|')];
+
+/// Auto-refresh interval of the result grid (`Off` = disabled).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefreshEvery {
+    Off,
+    Sec1,
+    Sec5,
+    Sec10,
+    Sec30,
+}
+
+impl RefreshEvery {
+    const ALL: [RefreshEvery; 5] = [
+        RefreshEvery::Off,
+        RefreshEvery::Sec1,
+        RefreshEvery::Sec5,
+        RefreshEvery::Sec10,
+        RefreshEvery::Sec30,
+    ];
+
+    fn period(self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+        use RefreshEvery::*;
+        match self {
+            Off => None,
+            Sec1 => Some(Duration::from_secs(1)),
+            Sec5 => Some(Duration::from_secs(5)),
+            Sec10 => Some(Duration::from_secs(10)),
+            Sec30 => Some(Duration::from_secs(30)),
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshEvery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RefreshEvery::Off => "no",
+            RefreshEvery::Sec1 => "1 s",
+            RefreshEvery::Sec5 => "5 s",
+            RefreshEvery::Sec10 => "10 s",
+            RefreshEvery::Sec30 => "30 s",
+        })
+    }
+}
+
+/// Guard for the auto-refresh timer: only a single read-only statement
+/// re-runs unattended. Word-mangled uppercase scan rejects anything with a
+/// data/DDL keyword anywhere (including data-modifying `WITH` CTEs) and any
+/// multi-statement payload.
+fn auto_refreshable(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if trimmed.is_empty() || trimmed.contains(';') {
+        return false;
+    }
+    // Blank out everything that is not alphanumeric so word boundaries are
+    // plain spaces (`--comment; DELETE…` still contains " DELETE ").
+    let flat: String = trimmed
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    let flat = format!(" {} ", flat.to_ascii_uppercase());
+    for bad in [
+        " INSERT ",
+        " UPDATE ",
+        " DELETE ",
+        " DROP ",
+        " ALTER ",
+        " TRUNCATE ",
+        " CREATE ",
+        " REPLACE ",
+        " MERGE ",
+        " ATTACH ",
+        " VACUUM ",
+        " SET ",
+        " GRANT ",
+        " REVOKE ",
+    ] {
+        if flat.contains(bad) {
+            return false;
+        }
+    }
+    let first = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        first.as_str(),
+        "SELECT" | "WITH" | "SHOW" | "PRAGMA" | "EXPLAIN" | "DESCRIBE"
+    )
+}
 
 /// Which navigator row the last left-click hit (time-based double click;
 /// `MouseArea::on_double_click` never fires wrapping a button because the
@@ -808,6 +905,7 @@ fn boot() -> (App, Task<Message>) {
             data_edit: None,
             data_pending: None,
             import: None,
+            auto_refresh: RefreshEvery::Off,
             selected_object: None,
             root: None,
             tree: HashMap::new(),
@@ -2344,6 +2442,50 @@ impl App {
             Message::ImportClose => {
                 self.import = None;
                 Task::none()
+            }
+            Message::AutoSet(interval) => {
+                self.auto_refresh = interval;
+                self.status = match interval.period() {
+                    Some(p) => format!(
+                        "auto-refresh cada {} s",
+                        p.as_secs()
+                    ),
+                    None => "auto-refresh: no".to_string(),
+                };
+                Task::none()
+            }
+            Message::AutoTick => {
+                // A modal/overlay owns the center or the result is being
+                // edited: never re-run behind the user's back (drafts and
+                // selected rows would go stale against fresh grid rows).
+                if self.data_edit.is_some()
+                    || self.import.is_some()
+                    || self.sync.is_some()
+                    || self.designer.is_some()
+                    || self.er.is_some()
+                    || self.objects.is_some()
+                    || self.form.is_some()
+                {
+                    return Task::none();
+                }
+                let Some(id) = self.active_id else {
+                    return Task::none();
+                };
+                let Some(session) = self.sessions.get(&id) else {
+                    return Task::none();
+                };
+                let sql = self.editor.content();
+                if !auto_refreshable(&sql) {
+                    // Non read-only (or empty/edited): pause silently until
+                    // the user writes a runnable statement again.
+                    return Task::none();
+                }
+                let client = session.client.clone();
+                let mut req = ExecuteRequest::new(sql).with_max_rows(MAX_ROWS);
+                req.context = self.query_context.clone();
+                // data_pending is never armed here: the auto path must not
+                // (re)open the data-edit strip behind the user.
+                execute_task(self.rt.clone(), client, req, self.active_tab)
             }
             Message::DeleteSelected => {
                 let Some(i) = self.selected.take() else {
@@ -4772,6 +4914,14 @@ impl App {
                         button(text("Exportar…").size(12))
                             .on_press_maybe(has_results.then_some(Message::Export))
                             .style(theme::flat),
+                        text("Auto:").size(11).color(theme::muted()),
+                        pick_list(
+                            RefreshEvery::ALL,
+                            Some(self.auto_refresh),
+                            Message::AutoSet,
+                        )
+                        .text_size(12)
+                        .width(76),
                     ]
                     .spacing(6)
                     .align_y(iced::Alignment::Center),
@@ -4941,7 +5091,11 @@ impl App {
         // window events keep the frameless style asserted after resizes.
         let window = iced::window::open_events().map(Message::WindowOpened);
         let events = iced::window::events().map(|(_id, ev)| Message::WinEvent(ev));
-        Subscription::batch([keys, window, events])
+        let mut subs = vec![keys, window, events];
+        if let Some(period) = self.auto_refresh.period() {
+            subs.push(iced::time::every(period).map(|_| Message::AutoTick));
+        }
+        Subscription::batch(subs)
     }
 
     fn theme(&self) -> Theme {
@@ -6469,6 +6623,59 @@ mod tests {
         // Empty mapping blocks the run button (mapped_count == 0).
         st.mapping = vec![None, None, None];
         assert_eq!(st.mapped_count(), 0);
+    }
+
+    #[test]
+    fn auto_refreshable_accepts_single_readonly_statements() {
+        assert!(auto_refreshable("SELECT * FROM usuarios"));
+        assert!(auto_refreshable("select 1"));
+        assert!(auto_refreshable(
+            "WITH t AS (SELECT 1) SELECT * FROM t;"
+        ));
+        assert!(auto_refreshable("SHOW TABLES"));
+        assert!(auto_refreshable("PRAGMA table_info(usuarios)"));
+        assert!(auto_refreshable("EXPLAIN SELECT id FROM usuarios"));
+        // Trailing semicolon + whitespace is still a single statement.
+        assert!(auto_refreshable("SELECT id FROM usuarios;  \n"));
+    }
+
+    #[test]
+    fn auto_refreshable_rejects_writes_multistatement_and_empty() {
+        assert!(!auto_refreshable("INSERT INTO usuarios (id) VALUES (1)"));
+        assert!(!auto_refreshable("DELETE FROM usuarios"));
+        assert!(!auto_refreshable("UPDATE usuarios SET id = 1"));
+        assert!(!auto_refreshable("DROP TABLE usuarios"));
+        assert!(!auto_refreshable("TRUNCATE usuarios"));
+        assert!(!auto_refreshable(""));
+        assert!(!auto_refreshable("   \n\t"));
+        // Two statements, even a benign prefix with a trailing write.
+        assert!(!auto_refreshable("SELECT 1; DROP TABLE usuarios"));
+        // Data-modifying CTE behind a WITH opener.
+        assert!(!auto_refreshable(
+            "WITH x AS (DELETE FROM usuarios RETURNING *) SELECT 1"
+        ));
+        // Write keyword hidden in a comment still trips the word scan.
+        assert!(!auto_refreshable("-- DELETE\nSELECT 1"));
+        // The first keyword decides (a leading comment makes it unknown).
+        assert!(!auto_refreshable("-- hola\nSELECT 1"));
+    }
+
+    #[test]
+    fn refresh_every_periods_and_labels() {
+        use std::time::Duration;
+        assert_eq!(RefreshEvery::Off.period(), None);
+        assert_eq!(
+            RefreshEvery::Sec1.period(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            RefreshEvery::Sec30.period(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(RefreshEvery::Off.to_string(), "no");
+        assert_eq!(RefreshEvery::Sec10.to_string(), "10 s");
+        assert_eq!(RefreshEvery::ALL.len(), 5);
+        assert_eq!(RefreshEvery::ALL[0], RefreshEvery::Off);
     }
 }
 
